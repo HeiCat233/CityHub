@@ -444,6 +444,28 @@ CityHub/
 
 **环境**：JDK 8、Maven 3.6+、MySQL 8、Redis 6+、RabbitMQ（含 management）。
 
+### 7.0 前端部署记录（✅ 已完成，2026-10-03）
+
+| 项目 | 内容 |
+|---|---|
+| nginx 目录 | `D:\develop\nginx-1.18.0`（课程原版包，自带 hmdp 前端页面 + 已配好的 conf） |
+| 备用官方版 | `D:\develop\nginx-1.24.0`（干净版，未配置，后续备用） |
+| 前端页面 | `D:\develop\nginx-1.18.0\html\hmdp\`（13 个页面：首页/商铺详情/笔记/登录等） |
+| 访问地址 | http://localhost:8080 （**需后端 8081 已启动**，否则页面打得开但接口 502） |
+| 代理配置 | conf/nginx.conf：`location /` 托管静态页；`location /api` 去掉 /api 前缀后转发到 `127.0.0.1:8081` |
+| 图片上传 | 后端硬编码写 `D:\tlias\nginx-1.18.0 dianping\html\hmdp\imgs`，已建 **目录联接**（junction）指向 `D:\develop\nginx-1.18.0\html\hmdp\imgs`——不改代码、不占空间，上传的图片前端立即可见 |
+
+nginx 常用命令（在 `D:\develop\nginx-1.18.0` 下执行）：
+
+```bash
+./nginx.exe            # 启动（建议: cmd //c "start /min nginx.exe" 脱离终端运行）
+./nginx.exe -s stop    # 停止
+./nginx.exe -s reload  # 改 conf 后热重载
+./nginx.exe -t         # 检查配置语法
+```
+
+> 注意：不要直接在前台终端 Ctrl+C 掉 nginx 进程；改了 `nginx.conf` 必须 `-s reload` 才生效。
+
 ```bash
 # 1. MySQL：建库并导入（库名必须是 dingping）
 mysql -uroot -p < src/main/resources/db/hmdp.sql
