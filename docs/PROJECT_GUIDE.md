@@ -15,6 +15,7 @@
 5. [风险点与已知问题清单](#5-风险点与已知问题清单)
 6. [改造方案草稿（待确认后实施）](#6-改造方案草稿)
 7. [本地运行指南](#7-本地运行指南)
+8. [部署方案（生产环境）](#8-部署方案生产环境)
 
 ---
 
@@ -424,7 +425,7 @@ CityHub/
 1. **业务重构**：建 `db/tickethub.sql`（新表+演示数据）→ 实体/Mapper/Service/Controller/Lua/拦截器按映射表改写 → 清理第 5 节风险点中影响改造的部分（2/3/5/6/9/10）
 2. **前端**：`frontend/` 新建 Vue3 + Vite + Element Plus（首页/演出详情/抢票页/订单页/个人中心/登录页 6 个页面；验证码直接显示在页面上方便演示）
 3. **接口文档**：集成 Knife4j，答辩兜底
-4. **部署**：后端 Dockerfile（多阶段构建）+ `docker-compose.yml`（app+mysql+redis+rabbitmq+nginx）+ README 一键部署指南
+4. **部署**：后端 Dockerfile + `docker-compose.yml`（app + mysql + redis + rabbitmq）；前端 `npm run build` 产物上传 **OSS**；服务器用 **nginx 做 API 网关**（反向代理 / 限流 / SSL / 负载均衡），详见第 8 章
 5. **推送**：分阶段 commit 到 main
 
 ### 6.5 答辩演示流程（草稿）
@@ -496,3 +497,237 @@ SMEMBERS seckill:order:10  # 已购用户集合
 ZREVRANGE blog:liked:1 0 4 # 笔记点赞榜前5
 GEOSEARCH shop:geo:1 FROMLONLAT 116.4 39.9 BYRADIUS 5000 m WITHDIST
 ```
+
+---
+
+## 8. 部署方案（生产环境）
+
+> 目标：**静态资源走 OSS + CDN，后端走 API 服务器（nginx 做网关）**。
+> 本机已有环境：阿里云服务器（**Ubuntu**，已购买）、阿里云 OSS Bucket（已有）。
+> 本地演示环境（Windows + nginx 1.18.0）保持不动，断网也能答辩。
+
+### 8.1 总体架构
+
+```
+                        用户浏览器
+                            │
+          ┌─────────────────┴──────────────────┐
+          │                                    │
+   静态资源请求                           API 请求
+   (HTML/JS/CSS/图片)                    (/api/*)
+          │                                    │
+          ▼                                    ▼
+   阿里云 OSS + CDN                     云服务器(Ubuntu)
+   (静态网站托管)                            │
+          │                          ┌───────┴────────┐
+          │                          │  nginx :443    │  ← API 网关
+          │                          │  反向代理/限流  │
+          │                          │  SSL/负载均衡   │
+          │                          └───────┬────────┘
+          │                                  ▼
+          │                          Spring Boot :8081
+          │                                  │
+          │                    ┌─────────────┼─────────────┐
+          │                    ▼             ▼             ▼
+          │                 MySQL 8       Redis 7      RabbitMQ
+          │
+          └── 上传图片也直传 OSS（替代原硬编码磁盘路径，解决风险 8）
+```
+
+**为什么这样分层**
+
+| 层次 | 组件 | 理由 |
+|---|---|---|
+| 静态资源 | OSS + CDN | 学生机带宽通常仅 3–5Mbps，前端包 1–3MB 首屏要 3–8 秒；CDN 边缘节点秒开，答辩不翻车 |
+| API 入口 | nginx | 反向代理、限流、SSL、负载均衡，练手点全保留，也是生产标准做法 |
+| 应用 | Spring Boot | 抢票核心链路（Lua 秒杀 + MQ 异步 + 乐观锁） |
+| 数据 | MySQL/Redis/RabbitMQ | 主存储 + 缓存/秒杀 + 异步队列 |
+| 图片 | OSS | 顺带修掉 `UploadController` 硬编码本机路径的问题（风险 8） |
+
+### 8.2 服务器准备（Ubuntu）
+
+```bash
+# 1. 更新系统
+sudo apt update && sudo apt upgrade -y
+
+# 2. 安装 Docker 与 Compose 插件
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER      # 重新登录后生效
+docker --version && docker compose version
+
+# 3. 安装 nginx（作为 API 网关，不用 Docker 跑，便于练手）
+sudo apt install -y nginx
+nginx -v
+
+# 4. 防火墙：只放行 22 / 80 / 443（8081/3306/6379/5672 一律不对外）
+sudo ufw allow 22 && sudo ufw allow 80 && sudo ufw allow 443 && sudo ufw enable
+```
+
+> 同时要在**阿里云控制台的安全组**里放行 22 / 80 / 443，两处都要开。
+
+### 8.3 后端部署（Docker Compose）
+
+后端连同 MySQL / Redis / RabbitMQ 用 Compose 一键起，`docker-compose.yml` 的编排要点：
+
+```yaml
+services:
+  app:
+    build: .
+    ports: ["8081:8081"]        # 只给宿主机 nginx 用，不对外暴露
+    depends_on: [mysql, redis, rabbitmq]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/tickethub
+      SPRING_REDIS_HOST: redis
+      SPRING_RABBITMQ_HOST: rabbitmq
+  mysql:  { image: mysql:8.0,  volumes: ["mysql-data:/var/lib/mysql"] }
+  redis:  { image: redis:7,    volumes: ["redis-data:/data"] }
+  rabbitmq:
+    image: rabbitmq:3-management
+    volumes: ["rabbitmq-data:/var/lib/rabbitmq"]
+volumes: { mysql-data: {}, redis-data: {}, rabbitmq-data: {} }
+```
+
+关键点：
+
+- **配置外置**：数据库密码、Redis 地址、OSS 密钥全部走环境变量，不要写进镜像（修掉风险 7 的明文密码）
+- **数据卷持久化**：三个 volume 保证容器重建数据不丢
+- **只暴露 8081 给宿主机**，由 nginx 转发；3306/6379/5672 只在 Docker 内网互通
+- 启动：`docker compose up -d --build`，日志 `docker compose logs -f app`
+
+### 8.4 nginx API 网关配置（重点练手部分）
+
+`/etc/nginx/conf.d/tickethub.conf`：
+
+```nginx
+# 限流区：抢票接口按 IP 限速，10 次/秒，突发 20
+limit_req_zone $binary_remote_addr zone=seckill:10m rate=10r/s;
+# 全局接口限流：50 次/秒
+limit_req_zone $binary_remote_addr zone=api:10m rate=50r/s;
+
+upstream backend {
+    server 127.0.0.1:8081 weight=1 max_fails=3 fail_timeout=10s;
+    # server 127.0.0.1:8082 weight=1;   # 将来扩实例，负载均衡立即生效
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name api.yourdomain.com;
+    return 301 https://$host$request_uri;      # 强制 HTTPS
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.yourdomain.com/privkey.pem;
+
+    client_max_body_size 10m;
+    gzip on;
+    gzip_types application/json text/css application/javascript;
+
+    # 抢票接口：严格限流
+    location /api/seckill/ {
+        limit_req zone=seckill burst=20 nodelay;
+        limit_req_status 429;
+        rewrite ^/api(/.*)$ $1 break;
+        proxy_pass http://backend;
+        include /etc/nginx/proxy_params;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 其他接口：宽松限流
+    location /api/ {
+        limit_req zone=api burst=100 nodelay;
+        rewrite ^/api(/.*)$ $1 break;
+        proxy_pass http://backend;
+        include /etc/nginx/proxy_params;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo nginx -t          # 改完必查语法
+sudo systemctl reload nginx
+```
+
+**这一层能练到的 nginx 能力**
+
+| 能力 | 对应配置 | 项目场景 |
+|---|---|---|
+| 反向代理 | `proxy_pass` + header 透传 | `/api` → 8081 |
+| 负载均衡 | `upstream` + `weight` + `max_fails` | 起两个后端实例 |
+| 限流 | `limit_req_zone` + `burst` + `nodelay` | 抢票接口防刷（与 Redis 滑动窗口形成两层防护） |
+| HTTPS | 证书 + 80→443 跳转 | OSS 是 HTTPS，后端必须跟，否则混合内容被拦 |
+| gzip / 超时 | `gzip`、`proxy_read_timeout` | 接口性能 |
+| 日志 | `access_log` 自定义格式 | 喂给大数据模块做埋点分析 |
+
+> `X-Real-IP` 这几行很关键：限流和访问日志要拿到**真实客户端 IP**，否则统计到的全是 nginx 的地址。
+
+### 8.5 前端部署（OSS + CDN）
+
+```bash
+# 1. 构建（API 地址通过环境变量注入）
+cd frontend
+echo "VITE_API_BASE=https://api.yourdomain.com/api" > .env.production
+npm run build                      # 产出 dist/
+
+# 2. 上传到 OSS（ossutil 示例）
+ossutil cp -r dist/ oss://your-bucket/ --update
+```
+
+OSS 控制台配置：
+
+1. **静态网站托管**：默认首页 `index.html`；默认 404 页也填 `index.html`（Vue Router history 模式必需）
+2. **跨域 CORS**：来源填 `https://your-bucket.oss-cn-xxx.aliyuncs.com`（或你的自定义域名），允许 `GET/POST/PUT/DELETE` 与 `authorization` 头
+3. **CDN 加速**：绑定 CDN 域名 + 证书，回源指向 bucket
+4. **图片目录**：新建 `imgs/` 前缀，开启公共读（或用签名 URL）
+
+后端对应改造：
+
+- 加 CORS 配置（`WebMvcConfigurer#addCorsMappings` 或 `@CrossOrigin`），否则浏览器直接拦截
+- `UploadController` 改为**上传到 OSS**（引入 `aliyun-sdk-oss`），返回 OSS 图片 URL——彻底解决风险 8 的硬编码路径
+- 前端 axios `baseURL` 读 `import.meta.env.VITE_API_BASE`
+
+### 8.6 HTTPS 证书
+
+用 Let's Encrypt 免费证书（certbot）：
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d api.yourdomain.com
+sudo certbot renew --dry-run     # 验证自动续期
+```
+
+> 若暂时不想买域名，可先用自签证书或直接 http 调试；但**OSS 页面是 HTTPS，正式演示前后端必须上 HTTPS**。
+
+### 8.7 上线检查清单
+
+- [ ] 安全组 / ufw 只开 22、80、443
+- [ ] MySQL / Redis / RabbitMQ 端口未对公网暴露
+- [ ] 数据库密码、OSS 密钥走环境变量，未提交到 Git
+- [ ] `nginx -t` 通过，80 自动跳 443
+- [ ] 后端 CORS 放行 OSS 域名
+- [ ] 前端 `VITE_API_BASE` 指向 `https://api.域名/api`
+- [ ] OSS 静态托管 + 404 回退 `index.html` 已配
+- [ ] 秒杀接口 nginx 限流已生效（`ab`/`wrk` 压测验证 429）
+- [ ] 全链路演示：OSS 打开首页 → 抢票 → 订单 → 支付
+
+### 8.8 本地与线上双环境对照
+
+| 能力 | 本地（演示/练手） | 线上（生产） |
+|---|---|---|
+| 静态资源 | nginx 直接托管 `html/` | OSS + CDN |
+| API 入口 | nginx `proxy_pass` 8081 | nginx 网关 + SSL + 限流 |
+| 后端 | `mvn spring-boot:run` | Docker Compose |
+| 数据 | 本机 MySQL/Redis/RabbitMQ | 容器 + 数据卷 |
+| 图片 | 本机磁盘（目录联接） | OSS |
+| HTTPS | 无 | Let's Encrypt |
+
+> 本地环境保留全套 nginx 练手（反向代理、负载均衡、限流、静态托管），线上用 OSS 剥离静态资源、nginx 只做网关——两边都不浪费。
