@@ -1,32 +1,50 @@
-  server:
-    port: 8081
-  spring:
-    rabbitmq:
-      host: localhost
-      port: 5672
-      username: guest
-      password: guest
-    application:
-      name: hmdp
-    datasource:
-      driver-class-name: com.mysql.jdbc.Driver
-      url: jdbc:mysql://127.0.0.1:3306/dingping?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
-      username: root
-      password: 290390
-    redis:
-      host: 127.0.0.1
-      port: 6379
+server:
+  port: ${SERVER_PORT:8081}
 
-      lettuce:
-        pool:
-          max-active: 30
-          max-idle: 15
-          min-idle: 5
-          time-between-eviction-runs: 10s
-    jackson:
-      default-property-inclusion: non_null # JSON处理时忽略非空字段
-  mybatis-plus:
-    type-aliases-package: com.hmdp.entity # 别名扫描包
-  logging:
-    level:
-      com.hmdp: debug
+spring:
+  application:
+    name: ticket-hub
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${MYSQL_URL:jdbc:mysql://127.0.0.1:3306/tickethub?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8}
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:root}
+  redis:
+    host: ${REDIS_HOST:127.0.0.1}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    lettuce:
+      pool:
+        max-active: 30
+        max-idle: 15
+        min-idle: 5
+        time-between-eviction-runs: 10s
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+  jackson:
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  type-aliases-package: com.tickethub.entity
+
+logging:
+  level:
+    com.tickethub: debug
+
+# ------------------------------------------------------------------
+# 图片上传：配置了 OSS 走对象存储，未配置时自动降级为本地目录
+# 生产环境请用环境变量注入，不要提交密钥到仓库
+# ------------------------------------------------------------------
+ticket:
+  oss:
+    enabled: ${OSS_ENABLED:false}
+    endpoint: ${OSS_ENDPOINT:}
+    bucket: ${OSS_BUCKET:}
+    access-key-id: ${OSS_ACCESS_KEY_ID:}
+    access-key-secret: ${OSS_ACCESS_KEY_SECRET:}
+    url-prefix: ${OSS_URL_PREFIX:}
+  upload:
+    local-dir: ${UPLOAD_LOCAL_DIR:./uploads}

@@ -1,0 +1,94 @@
+# TicketHub 后端一键部署（服务器上执行：docker compose up -d --build）
+# 前端静态资源部署在阿里云 OSS，不在本编排内
+services:
+  app:
+    build: .
+    image: tickethub-app:latest
+    container_name: tickethub-app
+    restart: always
+    ports:
+      - "127.0.0.1:8081:8081"      # 只绑定本机，由宿主机 nginx 反向代理，不直接对外
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_URL: jdbc:mysql://mysql:3306/tickethub?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
+      MYSQL_USERNAME: ${MYSQL_USERNAME:-tickethub}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-tickethub}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?请在 .env 中设置 RABBITMQ_PASSWORD}
+      OSS_ENABLED: ${OSS_ENABLED:-false}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
+      OSS_URL_PREFIX: ${OSS_URL_PREFIX:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+    networks: [tickethub]
+
+  mysql:
+    image: mysql:8.0
+    container_name: tickethub-mysql
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: tickethub
+      MYSQL_USER: ${MYSQL_USERNAME:-tickethub}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次启动自动导入建表与演示数据
+      - ./src/main/resources/db/tickethub.sql:/docker-entrypoint-initdb.d/01-tickethub.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [tickethub]
+
+  redis:
+    image: redis:7
+    container_name: tickethub-redis
+    restart: always
+    command: >
+      sh -c 'if [ -n "$$REDIS_PASSWORD" ]; then
+               redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD";
+             else
+               redis-server --appendonly yes;
+             fi'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    networks: [tickethub]
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: tickethub-rabbitmq
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-tickethub}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?请在 .env 中设置 RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks: [tickethub]
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
+
+networks:
+  tickethub:
+    driver: bridge
