@@ -17,7 +17,7 @@
 | 分布式锁 | Redisson 3.13.6 | 订单防重 |
 | 对象存储 | 阿里云 OSS（可选） | 图片上传，未配置自动降级本地目录 |
 | 前端 | Vue 3 · Vite · Element Plus · Pinia | 桌面/移动自适应 SPA |
-| 部署 | Docker · Docker Compose · nginx · OSS + CDN | 见第 8 章部署方案 |
+| 部署 | Docker · Docker Compose · nginx · 阿里云 ECS | 见 [`docs/DEPLOY.md`](docs/DEPLOY.md) |
 
 ## 核心技术点
 
@@ -136,43 +136,42 @@ CityHub/
 │   ├── seckill.lua         # 抢票资格原子校验脚本
 │   └── db/tickethub.sql    # 建库建表 + 演示数据
 ├── frontend/          # Vue 3 + Vite + Element Plus
-├── deploy/            # nginx 网关配置、.env 模板
-├── Dockerfile
+├── deploy/            # 一键部署脚本、nginx 配置、.env 模板
+├── Dockerfile         # 完整构建版（服务器内编译，备用）
+├── Dockerfile.runtime # 服务器实际使用：只运行本地构建好的 jar
 ├── docker-compose.yml
-└── docs/              # 项目讲解文档、部署方案
+└── docs/              # PROJECT_GUIDE.md（项目讲解）、DEPLOY.md（部署手册）
 ```
 
 ## 部署到服务器
 
-完整方案见 [`docs/PROJECT_GUIDE.md`](docs/PROJECT_GUIDE.md) 第 8 章，架构为
-**静态资源走 OSS + CDN，API 走 nginx 网关 + Docker Compose**。
+**完整教程见 [`docs/DEPLOY.md`](docs/DEPLOY.md)**，包含手动部署（8 步详解）与自动部署脚本两套流程。
 
-```bash
-# 1. 服务器准备（Ubuntu）
-curl -fsSL https://get.docker.com | sudo sh
-sudo apt install -y nginx
+架构：**nginx 同时托管前端静态资源与反向代理 API，后端 + MySQL + Redis + RabbitMQ
+由 Docker Compose 编排在同一台 ECS 上**。OSS（可选）只用于存放用户上传的图片。
 
-# 2. 配置环境变量
-cp deploy/.env.example deploy/.env
-vim deploy/.env               # 填 MySQL / RabbitMQ / OSS 密码
+> 为什么前端不放 OSS：阿里云 OSS 默认域名访问 HTML 会被强制下载，必须绑定自定义域名。
+> 课程阶段无域名，因此静态资源交给 nginx，OSS 只存图片（详见 DEPLOY.md 第 0 章）。
 
-# 3. 启动后端与依赖
-docker compose up -d --build
-docker compose logs -f app
+**快速部署（本地构建 → 上传 → 一键脚本）**：
 
-# 4. 配置 nginx API 网关
-sudo cp deploy/nginx/tickethub.conf /etc/nginx/conf.d/
-sudo vim /etc/nginx/conf.d/tickethub.conf    # 替换域名
-sudo nginx -t && sudo systemctl reload nginx
+```powershell
+# 1. 本地构建（服务器是 2核2G，不在服务器上编译）
+mvn -DskipTests clean package
+cd frontend; npm run build; cd ..
 
-# 5. 前端构建并上传 OSS
-cd frontend
-echo "VITE_API_BASE=https://api.你的域名/api" > .env.production
-npm run build
-ossutil cp -r dist/ oss://你的bucket/ --update
+# 2. 上传到服务器
+$IP = "<ECS公网IP>"; $KEY = "<密钥路径>"
+ssh -i $KEY ubuntu@$IP "sudo mkdir -p /opt/tickethub && sudo chown -R ubuntu:ubuntu /opt/tickethub"
+scp -i $KEY -r docker-compose.yml Dockerfile.runtime deploy src pom.xml ubuntu@$IP:/opt/tickethub/
+scp -i $KEY -r target ubuntu@$IP:/opt/tickethub/
+scp -i $KEY -r frontend/dist ubuntu@$IP:/opt/tickethub/frontend/
+
+# 3. 服务器上一键部署（装 Docker/nginx、建 swap、生成密码、起容器、健康检查）
+ssh -i $KEY ubuntu@$IP "sudo bash /opt/tickethub/deploy/deploy.sh"
 ```
 
-OSS 侧需要开启静态网站托管（404 回退 `index.html`）、配置跨域规则。
+访问 `http://<ECS公网IP>/` 即可。前置条件：阿里云安全组放行 **22、80** 端口。
 
 ## 演示脚本（答辩用）
 
@@ -187,6 +186,7 @@ OSS 侧需要开启静态网站托管（404 回退 `index.html`）、配置跨�
 ## 文档
 
 - [`docs/PROJECT_GUIDE.md`](docs/PROJECT_GUIDE.md) — 项目讲解、核心链路逐行分析、技术点核对、风险清单、部署方案
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — **部署手册**：架构原理、手动部署 8 步、自动部署脚本、运维排错
 
 ## License
 

@@ -1,0 +1,34 @@
+# ============================================================
+# 换行符策略
+#
+# Windows 上 core.autocrlf=true 会把文本文件的换行统一成 CRLF。
+# 这对 shell 脚本是致命的：Linux 会把 CRLF 里的 \r 当成命令的一部分，
+# 报错 `bad interpreter: /bin/bash^M: no such file or directory`，
+# 导致 deploy.sh 在服务器上完全无法执行。
+#
+# 因此这里强制 shell 脚本、Dockerfile 等必须在 Linux 上运行的文件
+# 一律使用 LF 换行，与开发者的操作系统无关。
+# ============================================================
+
+# ---- 必须在 Linux 上执行的文件：强制 LF ----
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.conf          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# ---- 脚本不允许被 Git 做任何换行转换 ----
+deploy/deploy.sh  -text
+
+# ---- Windows 批处理：强制 CRLF ----
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# ---- 二进制资源不做转换 ----
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.jar           binary

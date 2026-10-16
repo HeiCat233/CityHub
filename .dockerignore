@@ -1,0 +1,39 @@
+# ============================================================
+# Docker 构建上下文过滤
+#
+# 作用：docker build 会先把整个目录打包发给 Docker 守护进程，
+# 不排除的话 node_modules/.git 会让上下文达到几百 MB，构建很慢。
+#
+# 注意：Dockerfile.runtime 需要 target/*.jar，
+# 所以这里只排除 target 下的非 jar 产物。
+# ============================================================
+
+# ---- 版本控制 / 编辑器 ----
+.git
+.gitignore
+.idea
+.vscode
+*.iml
+
+# ---- 前端 ----
+# 前端是独立构建的（npm run build），不需要进后端镜像
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# ---- Maven 产物：保留 jar，排除其他 ----
+target/*
+!target/*.jar
+
+# ---- 运行时数据与日志 ----
+uploads
+logs
+*.log
+
+# ---- 密钥 ----
+.env
+deploy/.env
+
+# ---- 文档 ----
+docs
+README.md

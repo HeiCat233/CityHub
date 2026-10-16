@@ -24,3 +24,6 @@ logs/
 .env
 deploy/.env
 *.local
+
+# 说明：环境文件必须放在项目根目录（docker compose 只会读取
+# compose 文件同目录下的 .env），deploy/.env 是历史路径，一并忽略以防误提交。

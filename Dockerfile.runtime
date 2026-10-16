@@ -1,0 +1,30 @@
+# ============================================================
+# TicketHub 运行版镜像（服务器不编译，只运行）
+#
+# 为什么需要它：
+#   2核2G 的 ECS 上跑 Maven 构建（下载依赖 + 编译）非常容易 OOM，
+#   而且每次都拉一遍 Maven 基础镜像很浪费。改为在本地/CI 上执行
+#   `mvn -DskipTests package`，把 jar 上传到服务器的 target/ 目录，
+#   服务器只用本文件构建一个「只 COPY jar」的极小镜像，构建耗时数秒。
+#
+# 本地构建命令：
+#   mvn -DskipTests clean package
+#
+# 服务器构建 + 启动：
+#   docker compose up -d --build
+# ============================================================
+FROM eclipse-temurin:8-jre
+
+WORKDIR /app
+ENV TZ=Asia/Shanghai
+
+# 2核2G 场景的 JVM 参数，docker-compose.yml 会用 JAVA_OPTS 覆盖
+ENV JAVA_OPTS="-Xms256m -Xmx512m -XX:MaxMetaspaceSize=160m -Xss512k -XX:+UseSerialGC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+
+# 必须先在本地执行过 mvn package，target/ 下要有可运行的 jar
+COPY target/ticket-hub-*.jar app.jar
+
+EXPOSE 8081
+
+# 用 sh -c 让 $JAVA_OPTS 被展开；exec 让 java 成为 PID 1 以正确接收信号
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

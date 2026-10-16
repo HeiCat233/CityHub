@@ -530,6 +530,20 @@ GEOSEARCH shop:geo:1 FROMLONLAT 116.4 39.9 BYRADIUS 5000 m WITHDIST
 
 ## 8. 部署方案（生产环境）
 
+> ⚠️ **本章为早期设计构想，已被 [`docs/DEPLOY.md`](DEPLOY.md) 取代，请以 DEPLOY.md 为准。**
+>
+> 两者差异（重要）：
+>
+> | 项 | 本章（早期构想） | DEPLOY.md（实际落地） |
+> |---|---|---|
+> | 前端托管 | OSS + CDN | **nginx**（无域名时 OSS 默认域名会把 HTML 强制下载） |
+> | 协议 | HTTPS + 域名 | **HTTP + 公网 IP**（课程阶段不买域名） |
+> | 后端构建 | 服务器内 `docker compose build` | **本地构建 jar 后上传**（2核2G 服务器内构建易 OOM） |
+> | 内存治理 | 未涉及 | 容器 `mem_limit` + JVM 堆限制 + 2G swap |
+> | OSS 定位 | 静态资源 + 图片 | **仅图片** |
+>
+> 本章保留作为「生产环境演进方向」的参考，附录 B 给出了升级到域名 + HTTPS + OSS/CDN 的步骤。
+
 > 目标：**静态资源走 OSS + CDN，后端走 API 服务器（nginx 做网关）**。
 > 本机已有环境：阿里云服务器（**Ubuntu**，已购买）、阿里云 OSS Bucket（已有）。
 > 本地演示环境（Windows + nginx 1.18.0）保持不动，断网也能答辩。

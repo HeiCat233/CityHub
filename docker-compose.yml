@@ -1,30 +1,64 @@
-# TicketHub 后端一键部署（服务器上执行：docker compose up -d --build）
-# 前端静态资源部署在阿里云 OSS，不在本编排内
+# ============================================================
+# TicketHub 单机部署编排（Ubuntu ECS / 2核2G / 无域名 HTTP）
+#
+# 启动：docker compose up -d
+# 日志：docker compose logs -f app
+# 停止：docker compose down          （数据卷保留）
+# 清库：docker compose down -v       （会删除 MySQL/Redis/MQ 数据，慎用）
+#
+# 本文件默认配合 Dockerfile.runtime 使用：jar 包在前端本地构建好再上传，
+# 服务器只负责运行，避免 2G 内存的机器上跑 Maven 编译被 OOM Kill。
+# ============================================================
+
 services:
+  # ---------- 后端应用 ----------
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
     image: tickethub-app:latest
     container_name: tickethub-app
     restart: always
+
+    # 只绑定到宿主机回环地址：外网无法直连 8081，
+    # 所有请求必须经过宿主机 nginx（限流/日志/后续负载均衡都在那里）。
     ports:
-      - "127.0.0.1:8081:8081"      # 只绑定本机，由宿主机 nginx 反向代理，不直接对外
+      - "127.0.0.1:8081:8081"
+
     environment:
       TZ: Asia/Shanghai
+
+      # JVM 堆参数。2核2G 机器上必须限制，否则 JVM 默认按物理内存的 1/4
+      # 取堆，容器极易被 OOM Killer 干掉。
+      JAVA_OPTS: "${JAVA_OPTS:--Xms256m -Xmx512m -XX:MaxMetaspaceSize=160m -Xss512k -XX:+UseSerialGC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai}"
+
       MYSQL_URL: jdbc:mysql://mysql:3306/tickethub?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
       MYSQL_USERNAME: ${MYSQL_USERNAME:-tickethub}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
+
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
       RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:-tickethub}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?请在 .env 中设置 RABBITMQ_PASSWORD}
+
+      # OSS 未启用时上传落到本地目录，由 nginx 的 /imgs/ 托管
+      UPLOAD_LOCAL_DIR: /app/uploads
       OSS_ENABLED: ${OSS_ENABLED:-false}
       OSS_ENDPOINT: ${OSS_ENDPOINT:-}
       OSS_BUCKET: ${OSS_BUCKET:-}
       OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
       OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
       OSS_URL_PREFIX: ${OSS_URL_PREFIX:-}
+
+    volumes:
+      # 用户上传的图片持久化到宿主机 /opt/tickethub/uploads，
+      # 与 nginx 的 location @tickethub_uploads 指向同一目录。
+      - ./uploads:/app/uploads
+
     depends_on:
       mysql:
         condition: service_healthy
@@ -32,56 +66,102 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_started
+
+    # 内存上限：容器内进程组超过这个值会被 cgroup 限制（不会拖垮整机）
+    mem_limit: 800m
+
     networks: [tickethub]
 
+  # ---------- MySQL ----------
   mysql:
     image: mysql:8.0
     container_name: tickethub-mysql
     restart: always
+
     environment:
       TZ: Asia/Shanghai
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: tickethub
       MYSQL_USER: ${MYSQL_USERNAME:-tickethub}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+
+    # 2G 内存的机器上，MySQL 默认配置（buffer pool 128M + performance_schema）
+    # 会吃掉 600M+。这里把 buffer pool 压到 128M 并关掉 performance_schema，
+    # 常驻内存能降到 350M 左右。演示环境完全够用。
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      - --innodb-buffer-pool-size=128M
+      - --performance-schema=OFF
+      - --max-connections=100
+
     volumes:
       - mysql-data:/var/lib/mysql
-      # 首次启动自动导入建表与演示数据
+      # 只在数据卷为空（首次启动）时执行，用于建表 + 灌演示数据。
+      # 之后重启不会重复执行，所以不会覆盖你抢到的订单。
       - ./src/main/resources/db/tickethub.sql:/docker-entrypoint-initdb.d/01-tickethub.sql:ro
+
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
+      start_period: 40s
+
+    mem_limit: 500m
     networks: [tickethub]
 
+  # ---------- Redis ----------
   redis:
     image: redis:7
     container_name: tickethub-redis
     restart: always
+
+    # maxmemory-policy 必须用 volatile-lru 而不是 allkeys-lru：
+    # 秒杀库存 key（seckill:stock:*）没有 TTL，allkeys-lru 可能在内存吃紧时
+    # 把库存淘汰掉，导致 Lua 脚本返回 -1「库存未预热」而抢票直接失败。
+    # volatile-lru 只淘汰设置了过期时间的 key（登录 token、缓存等），业务安全。
     command: >
       sh -c 'if [ -n "$$REDIS_PASSWORD" ]; then
-               redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD";
+               redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+                 --maxmemory 128mb --maxmemory-policy volatile-lru;
              else
-               redis-server --appendonly yes;
+               redis-server --appendonly yes
+                 --maxmemory 128mb --maxmemory-policy volatile-lru;
              fi'
+
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
     volumes:
       - redis-data:/data
+
+    mem_limit: 256m
     networks: [tickethub]
 
+  # ---------- RabbitMQ ----------
   rabbitmq:
     image: rabbitmq:3.12-management
     container_name: tickethub-rabbitmq
     restart: always
+
     environment:
       TZ: Asia/Shanghai
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-tickethub}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?请在 .env 中设置 RABBITMQ_PASSWORD}
+      # Erlang VM 默认会按「检测到的内存」申请，在 2G 机器上容易吃满。
+      #
+      # 这里必须用 absolute（绝对值 256MB）而不是 relative：
+      # relative 0.4 是按检测到的内存算的，若容器内检测到的是宿主机 2G，
+      # 阈值会变成 800M，反而超过本容器 400m 的 mem_limit，
+      # 结果水位线还没触发，容器就已被 OOM Killer 杀掉了。
+      # absolute 256MB 明确且可控：达到后 RabbitMQ 阻塞生产者而不是崩溃。
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit vm_memory_high_watermark.absolute 256MB"
+
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+
+    mem_limit: 400m
     networks: [tickethub]
 
 volumes:
