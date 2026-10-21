@@ -336,7 +336,17 @@ TicketHub 需要 1200–1500MB
 
 ### 4.1.1 精简档：不升配也能跑（已实测可用的配置）
 
-`docker-compose.yml` 里所有内存参数都改成可覆盖的了。在服务器 `.env` 里加上这 8 行：
+`docker-compose.yml` 里所有内存参数都改成可覆盖的了。
+
+**最省事：跑一键脚本**（幂等，自动备份原 `.env`）：
+
+```bash
+cd /opt/tickethub
+bash deploy/apply-compact.sh
+docker compose up -d --force-recreate
+```
+
+**或者手动**：在服务器 `.env` 里加上这 8 行：
 
 ```bash
 APP_MEM_LIMIT=512m
