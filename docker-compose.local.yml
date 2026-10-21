@@ -1,0 +1,179 @@
+# ============================================================
+# TicketHub 本地一键启动（本人自测 + 组员协作共用）
+#
+# 目标：组员只要装了 Docker Desktop，一条命令就能跑起完整环境，
+#       不需要装 JDK / Maven / Node / MySQL / Redis / RabbitMQ。
+#
+# 启动：
+#   docker compose -f docker-compose.local.yml up -d --build
+#   然后浏览器打开 http://localhost:8080
+#
+# 停止（保留数据）：
+#   docker compose -f docker-compose.local.yml down
+#
+# 重置数据库（清空订单、回到初始演示数据）：
+#   docker compose -f docker-compose.local.yml down -v
+#   docker compose -f docker-compose.local.yml up -d --build
+#
+# 端口说明（全部避开本机常见占用）：
+#   8080  -> 网站首页
+#   18081 -> 后端直连（调试用，正常走 8080/api）
+#   13306 -> MySQL（本机已有 MySQL80 占了 3306，所以错开）
+#   16379 -> Redis
+#   15672 -> RabbitMQ 管理台（guest/guest）
+# ============================================================
+
+services:
+  # ---------- 后端 ----------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tickethub-app:local
+    container_name: tickethub-local-app
+    restart: unless-stopped
+
+    environment:
+      TZ: Asia/Shanghai
+      # 本地机器内存通常 16G，不需要像 ECS 那样压到 512M
+      JAVA_OPTS: "-Xms256m -Xmx768m -XX:MaxMetaspaceSize=256m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+
+      MYSQL_URL: jdbc:mysql://mysql:3306/tickethub?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8
+      MYSQL_USERNAME: tickethub
+      MYSQL_PASSWORD: tickethub_local_pwd
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USERNAME: tickethub
+      RABBITMQ_PASSWORD: tickethub_local_mq
+
+      # 本地默认不开 OSS，上传落到共享卷，由 nginx 的 /imgs/ 托管
+      UPLOAD_LOCAL_DIR: /app/uploads
+      OSS_ENABLED: "false"
+
+    volumes:
+      - tickethub-uploads:/app/uploads
+
+    ports:
+      # 映射到 18081，方便 Postman/curl 直接打后端，不经过 nginx
+      - "18081:8081"
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+
+    networks: [tickethub-local]
+
+  # ---------- 前端 + nginx ----------
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: tickethub-web:local
+    container_name: tickethub-local-web
+    restart: unless-stopped
+
+    ports:
+      - "8080:80"
+
+    volumes:
+      # 与 app 共用上传目录，/imgs/xxx 才能读到后端写入的图片
+      - tickethub-uploads:/opt/tickethub/uploads:ro
+
+    depends_on:
+      - app
+
+    networks: [tickethub-local]
+
+  # ---------- MySQL ----------
+  mysql:
+    image: mysql:8.0
+    container_name: tickethub-local-mysql
+    restart: unless-stopped
+
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: root_local_pwd
+      MYSQL_DATABASE: tickethub
+      MYSQL_USER: tickethub
+      MYSQL_PASSWORD: tickethub_local_pwd
+
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      # 本地机器内存充足，给大一点的 buffer pool，查询更快
+      - --innodb-buffer-pool-size=256M
+
+    volumes:
+      - tickethub-mysql:/var/lib/mysql
+      # 只在数据卷为空（首次启动）时执行，用来建表 + 灌演示数据
+      - ./src/main/resources/db/tickethub.sql:/docker-entrypoint-initdb.d/01-tickethub.sql:ro
+
+    ports:
+      # 用 13306 而不是 3306：本机 MySQL80 服务已占用 3306
+      - "13306:3306"
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_local_pwd"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+    networks: [tickethub-local]
+
+  # ---------- Redis ----------
+  redis:
+    image: redis:7
+    container_name: tickethub-local-redis
+    restart: unless-stopped
+
+    # 本地不设密码、不限制 maxmemory：演示时不会有 key 被淘汰，
+    # 库存 key 永远在，抢票链路行为最接近理想状态。
+    command: redis-server --appendonly yes
+
+    volumes:
+      - tickethub-redis:/data
+
+    ports:
+      - "16379:6379"
+
+    networks: [tickethub-local]
+
+  # ---------- RabbitMQ ----------
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: tickethub-local-rabbitmq
+    restart: unless-stopped
+
+    environment:
+      TZ: Asia/Shanghai
+      RABBITMQ_DEFAULT_USER: tickethub
+      RABBITMQ_DEFAULT_PASS: tickethub_local_mq
+
+    volumes:
+      - tickethub-rabbitmq:/var/lib/rabbitmq
+
+    ports:
+      - "15672:15672"   # 管理台
+      - "5673:5672"     # AMQP（映射到 5673，避免与将来本机装 RabbitMQ 冲突）
+
+    networks: [tickethub-local]
+
+volumes:
+  tickethub-mysql:
+  tickethub-redis:
+  tickethub-rabbitmq:
+  tickethub-uploads:
+
+networks:
+  tickethub-local:
+    driver: bridge

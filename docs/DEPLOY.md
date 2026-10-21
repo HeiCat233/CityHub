@@ -1,5 +1,9 @@
 # TicketHub 部署手册（阿里云 ECS · Ubuntu · 无域名 HTTP）
 
+> ⚠️ **如果这台服务器上已经跑着别的服务**（例如海豹骰娘 + NapCat），
+> 请先读 [PRE_DEPLOY_CHECK.md](./PRE_DEPLOY_CHECK.md) 并跑一遍 `deploy/preflight.sh`。
+> 同机叠加部署的第一道坎不是端口，而是内存余量——不够就会 OOM，页面能开但接口 502。
+
 > 本文档面向「第一次部署 Java 项目」的情况，**每个命令都解释它做什么、为什么、怎么判断成功**。
 > 阅读顺序建议：第 0 章看懂架构 → 第 1 章准备 → 第 2 章手动部署（自己动手，能学到东西）
 > → 第 3 章自动部署（我替你跑，省事）→ 第 4 章验证 → 第 5~7 章按需查阅。
@@ -16,6 +20,9 @@
 8. [第 7 章 项目目录与文件职责](#第-7-章-项目目录与文件职责)
 9. [附录 A 服务器内构建](#附录-a服务器内构建备选方案)
 10. [附录 B 升级到域名 + HTTPS + OSS/CDN](#附录-b升级到域名--https--osscdn)
+
+> 相关文档：[PRE_DEPLOY_CHECK.md](./PRE_DEPLOY_CHECK.md)（部署前体检清单）、
+> [PROJECT_GUIDE.md](./PROJECT_GUIDE.md)（代码讲解）
 
 ---
 
@@ -283,13 +290,27 @@ free -h              # 看内存
 df -h /              # 看磁盘剩余
 ```
 
-### 2.2 第 2 步：创建 swap（2G 内存必做）
+### 2.2 第 2 步：创建 swap（已有则跳过）
 
-**做什么**：加一块 2G 的磁盘交换区。
+**做什么**：确认机器有 swap；没有才创建。
+
+> ⚠️ **先检查再动手。** 如果服务器上已经跑着别的服务（比如海豹骰娘），
+> 它可能已经建过 `/swapfile`。此时再执行 `fallocate` + `mkswap` 会失败，
+> 甚至干扰正在使用的交换区。正确做法是先跑下面这一条：
+
+```bash
+# 检查是否已有 swap。有输出（形如 /swapfile ... 4G）就说明已经存在，
+# 直接跳到第 3 步，后面的命令一条都不要执行。
+swapon --show
+free -m | grep -i swap
+```
+
+**只有在上面两条都没有任何输出时**，才执行下面的创建流程：
 
 ```bash
 # 创建 2G 的 swap 文件
-sudo fallocate -l 2G /swapfile
+sudo fallocate -l 2G /swapfile \
+  || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
 
 # 权限设为 600（只有 root 可读写，swap 文件必须这样）
 sudo chmod 600 /swapfile
@@ -300,12 +321,12 @@ sudo mkswap /swapfile
 # 启用
 sudo swapon /swapfile
 
-# 写入 fstab，保证重启后自动挂载
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+# 写入 fstab，保证重启后自动挂载（先判断，避免重复写入）
+grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 # 降低 swap 使用倾向（尽量用内存，swap 只兜底）
 sudo sysctl vm.swappiness=10
-echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 ```
 
 **为什么**：见 0.4 节。没有 swap 时，内存峰值会直接触发 OOM Killer 杀进程。
@@ -314,7 +335,9 @@ echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 
 ```bash
 free -h
-# 输出里 Swap 一行应该是 2.0Gi，而不是 0B
+# Swap 一行不应是 0B。已有的机器会显示 4.0Gi 之类，属正常。
+swapon --show
+# 应能看到 /swapfile 及其大小
 ```
 
 ### 2.3 第 3 步：安装 Docker 与 nginx
