@@ -706,6 +706,210 @@ docker compose restart app
 
 `deploy.sh` 的 `depends_on: service_started` 只保证「容器启动了」，不保证「RabbitMQ 能收消息」，所以首次部署后建议手动重启一次 app。
 
+## 第 4.8 节 安全加固：开着 80 端口，但不让扫描器舒服（2026-10-21 实录）
+
+### 4.8.0 先回答一个问题：能不能把 80 关掉只让自己人访问？
+
+**不能。** 原因很实在：
+
+- 你组员在异地，家里宽带 / 学校机房 / 手机热点，**出口 IP 每天都会变**
+- 阿里云安全组只能按 IP 段放行，写死了组员明天就进不来
+- 关掉 80 等于「谁都访问不了」，这和大作业要「当场演示 + 组员随时看」直接冲突
+
+所以正确思路不是「关门」，而是 **「门开着，但谁撬锁就拉黑谁」**。
+这就是 fail2ban 干的事：不改端口，只把行为异常的 IP 临时踢掉。
+
+### 4.8.1 三层防护，各挡什么
+
+| 层 | 位置 | 挡什么 | 代价 |
+|---|---|---|---|
+| 第 1 层 | nginx | 扫描路径直接 `return 444`（断连不回包）、隐藏版本号、限制 HTTP 方法 | 0，纯配置 |
+| 第 2 层 | fail2ban | 同一个 IP 反复扫描 → 封 6 小时；SSH 爆破 → 封 2 小时 | 极小，一个常驻进程约 20MB |
+| 第 3 层 | 阿里云安全组 | 只放行 22 / 80，其余端口一律不对外 | 0，控制台点几下 |
+
+**为什么不用 ufw？** 这台机器上跑着 Docker，Docker 会自己往 iptables 里插规则，
+ufw 的规则和 Docker 的规则会打架，容易出现「ufw 说拦了其实没拦」的假象。
+实测 `ufw status` 一直是 `inactive`，这是**故意的**，不是忘了开。
+真正在干活的是 fail2ban 的 iptables 链（`iptables -L f2b-tickethub-scanner -n` 能看到）。
+
+### 4.8.2 第 1 层：nginx 里做了什么
+
+打开 `deploy/nginx/tickethub.conf`，找 `server {` 块，关键几行：
+
+```nginx
+server_tokens off;          # 只回 "Server: nginx"，不回 "nginx/1.18.0 (Ubuntu)"
+
+# 扫描路径：直接断连
+location ~* /(\.env|\.git|...|config\.json)(/|$) {
+    access_log /var/log/nginx/tickethub-scan.log;   # 单独记，给 fail2ban 读
+    return 444;
+}
+```
+
+**`444` 是什么？** nginx 特有的非标准状态码：**收到请求后直接关掉 TCP 连接，一个字节都不回**。
+对比一下：
+
+| 返回 | 扫描器看到什么 | 后果 |
+|---|---|---|
+| `404` | 「这个路径不存在」 | 继续换路径扫 |
+| `403` | 「有东西但被拒绝」 | **加大力度**，认为这里有货 |
+| `444` | 连接被重置，什么都没有 | 无法判断，多半放弃 |
+
+**为什么扫描日志要单独写？**
+一开始我想用 `access_log off` 干脆不记，省得日志脏。
+但这样一来 fail2ban 就读不到任何东西，**第 2 层直接失效**。
+所以改成写 `tickethub-scan.log`：主日志保持干净，扫描日志专供 fail2ban 消费。
+
+**踩过的坑：`/config.json` 返回了 200。**
+前端是 Vue Router history 模式，任何不存在的路径都会 `try_files ... /index.html` 回退，
+于是扫描器请求 `/config.json` 拿到一个 200 的 HTML 页面，以为「找到配置文件了」。
+解决办法是把它加进上面的 444 列表——`dist` 里本来就没有 `config.json`，不会误伤。
+
+### 4.8.3 第 2 层：fail2ban 三个 jail
+
+配置文件 `deploy/security/jail.local`，部署到 `/etc/fail2ban/jail.d/tickethub.local`：
+
+| jail | 监控日志 | 阈值 | 封多久 |
+|---|---|---|---|
+| `sshd` | `/var/log/auth.log` | 10 分钟内 5 次失败 | 2 小时 |
+| `tickethub-scanner` | `/var/log/nginx/tickethub-scan.log` | 5 分钟内 3 次扫描 | 6 小时 |
+| `tickethub-ratelimit` | `/var/log/nginx/tickethub.error.log` | 5 分钟内 20 次 429 | 30 分钟 |
+
+**白名单（`ignoreip`）一定要写自己的 IP。**
+实测时我用自己的宽带 IP 连发 3 次 `/.env`，fail2ban 立刻把本机封了 6 小时，
+结果连自己的网站都打不开（`curl` 返回 `000`）。查自己出口 IP：
+
+```bash
+curl https://api.ipify.org
+```
+
+把这串 IP 加到 `ignoreip` 后面，多个用空格分隔。
+家里 / 学校 / 手机热点出口 IP 不一样，**演示前重新确认一次**。
+
+### 4.8.4 【重点】fail2ban 过滤器那个坑，值得单独讲
+
+这是这次卡最久的地方，写下来免得以后重踩。
+
+**现象**：日志里明明有 5 条扫描记录，`fail2ban-regex` 却报 `0 matched, 5 missed`。
+但把同一条正则拿去 Python `re.search`，返回 `True`。
+
+**根因**：`<HOST>` 不是简单的 IP 正则，它展开后**自带边界断言**（类似 `(?![.\w-])`）。
+一旦后面紧跟会回溯的模式，断言就和后续模式打架，匹配直接失败。
+
+实测对照（同一份日志、同一行）：
+
+```
+^<HOST>\s+-\s+-\s+\[           → 5 matched   （还行）
+^<HOST>\s+-\s+-\s+\[[^\]]+\]   → 0 matched   ← 字符类触发冲突
+^<HOST> - - \[.*?\]            → 5 matched   ← 用这个
+^<HOST> - - \[[^]]+\]          → 0 matched
+^<HOST> - - \[.+\]             → 0 matched
+```
+
+**结论**：前缀固定写 `^<HOST> - - \[.*?\]`（**字面空格 + 非贪婪通配**），
+中间一律用 `.*?`，**不要用 `\s+`，不要用字符类**。
+
+以后改 `deploy/security/tickethub-scanner.conf`，改完必须自检：
+
+```bash
+fail2ban-regex /var/log/nginx/tickethub-scan.log \
+               /etc/fail2ban/filter.d/tickethub-scanner.conf
+```
+
+看到 `N matched` 才算改对，`0 matched` 就是又踩坑了。
+
+### 4.8.5 怎么验证防护真的生效
+
+**验证 nginx 444（在你自己电脑上跑）**：
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}`n" http://8.148.238.219/.env
+# 期望输出 000（连接被重置）
+```
+
+**验证 fail2ban 会拉黑（服务器上跑，用一个假 IP 测，不影响真访问）**：
+
+```bash
+fail2ban-client set tickethub-scanner banip 203.0.113.66
+iptables -L f2b-tickethub-scanner -n | head -5     # 能看到 REJECT 规则
+fail2ban-client set tickethub-scanner unbanip 203.0.113.66
+```
+
+**看当前封了谁**：
+
+```bash
+fail2ban-client status tickethub-scanner
+fail2ban-client status sshd
+grep -E 'Ban |Unban ' /var/log/fail2ban.log | tail -20
+```
+
+**不小心把自己封了怎么救**：
+
+```bash
+fail2ban-client set tickethub-scanner unbanip 你的IP
+```
+
+（如果连 SSH 都进不去，就去阿里云控制台用 VNC 登录。）
+
+### 4.8.6 实测结果（2026-10-21）
+
+```
+# 扫描路径 → 全部断连
+/.env                 000
+/.git/config          000
+/wp-admin             000
+/phpmyadmin           000
+/backup.sql           000
+/.aws/credentials     000
+/config.json          000      ← 修掉的那个
+/application.properties  000
+
+# 正常路径 → 全部 200
+/                        200
+/api/show-category/list  200
+/api/show/1              200
+/imgs/types/concert.png  200
+
+# 版本号已隐藏
+Server: nginx            （原来 nginx/1.18.0 (Ubuntu)）
+
+# 真实封禁记录（我自己的 IP 被测出来了）
+NOTICE  [tickethub-scanner] Ban 111.55.167.170
+```
+
+### 4.8.7 还有一件事：骰娘的 4 个端口暴露在公网
+
+顺手查到的问题，**没有擅自改**，留给你决定：
+
+```
+3211  sealdice    WebUI   → 公网可访问，返回 200
+3212  sealdice-2  WebUI   → 公网可访问
+6099  napcat      WebUI   → 公网可访问，响应头带 Access-Control-Allow-Origin: *
+6100  napcat-2    WebUI   → 公网可访问
+```
+
+这两个服务都在 Docker 自定义网络（`dice_dice_net`）里，**容器之间通信不需要映射到公网**。
+现在写成 `- "3211:3211"` 等于监听 `0.0.0.0`，全网都能摸到管理面板。
+
+**如果这些面板只有你自己用**，最省事的改法是把端口绑定到回环：
+
+```yaml
+# /opt/dice/docker-compose.yml
+ports:
+  - "127.0.0.1:3211:3211"     # 只本机可访问
+```
+
+改完 `cd /opt/dice && docker compose up -d`。
+之后要访问面板，用 SSH 隧道：
+
+```powershell
+ssh -i D:\develop\dice\maoDice.pem -L 3211:127.0.0.1:3211 root@8.148.238.219
+# 然后浏览器开 http://127.0.0.1:3211
+```
+
+**如果你需要在外网管骰娘**，那就在阿里云安全组把这 4 个端口的来源 IP 限制成你自己的 IP，
+而不是 `0.0.0.0/0`。两种方案选一个，别都不做。
+
 ## 第 5 节 组员拿到项目后怎么跑（可以直接转发这段）
 
 ### 5.1 组员需要装的东西

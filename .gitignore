@@ -27,3 +27,7 @@ deploy/.env
 
 # 说明：环境文件必须放在项目根目录（docker compose 只会读取
 # compose 文件同目录下的 .env），deploy/.env 是历史路径，一并忽略以防误提交。
+
+# fail2ban 的 jail 配置按惯例叫 *.local，但它是部署资产必须入库，这里开例外。
+# 文件里只有 ignoreip 白名单，不含密码或密钥。
+!deploy/security/jail.local

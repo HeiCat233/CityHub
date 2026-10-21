@@ -1,0 +1,77 @@
+# ============================================================
+# TicketHub / 海豹骰娘 同机安全加固 —— fail2ban 配置
+#
+# 放在 /etc/fail2ban/jail.d/tickethub.local
+#
+# 作用：把「反复做坏事」的 IP 临时拉黑，而不是把整个 80 端口关掉。
+# 为什么不能关 80：你的组员在异地、IP 不固定，关 80 等于谁都访问不了。
+# 所以正确做法是「开着门，但谁撬锁就拉黑谁」。
+# ============================================================
+
+[DEFAULT]
+# 封禁时长：1 小时（演示期够用，误封也不会太久）
+bantime  = 1h
+# 统计窗口：10 分钟内
+findtime = 10m
+# 触发阈值：5 次
+maxretry = 5
+
+# 白名单：本机回环 + 你的服务器内网地址 + 你自己的常用出口 IP。
+#
+# 【重要】一定要把自己的出口 IP 写进来。
+# 我实测时用自己的宽带 IP 连发 3 次 /.env，fail2ban 立刻把本机封了 6 小时，
+# 结果演示时连自己的网站都打不开（curl 返回 000）。
+# 查自己出口 IP：curl https://api.ipify.org  或 浏览器搜「我的IP」。
+# 家里/学校/手机热点出口 IP 会变，演示前重新确认一次。
+#
+# 多个 IP 用空格分隔。如果 IP 经常变，演示期可以临时把 maxretry 调大。
+ignoreip = 127.0.0.1/8 ::1 172.28.196.51 111.55.167.170
+
+# 用 iptables-multiport 作为动作，只封具体端口，不影响其他服务
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+
+# ------------------------------------------------------------
+# 1. SSH 暴力破解
+# ------------------------------------------------------------
+# 你的 sshd 已经关了密码登录（PasswordAuthentication no），
+# 理论上密钥爆破不现实，但扫描器仍会疯狂尝试用户名，
+# 白占 CPU 和 auth.log。这里直接封掉。
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+logpath  = /var/log/auth.log
+maxretry = 5
+bantime  = 2h
+findtime = 10m
+
+# ------------------------------------------------------------
+# 2. nginx 扫描路径探测
+# ------------------------------------------------------------
+# 专门抓「访问 /.env、/.git、/wp-admin、/phpmyadmin」这类请求。
+# 正常人不会访问这些路径，出现就说明是扫描器。
+# 注意：nginx 配置里已经对这些路径返回 444（直接断连），
+# 444 也会写进 access log，所以这里能抓到。
+[tickethub-scanner]
+enabled  = true
+port     = http,https
+filter   = tickethub-scanner
+logpath  = /var/log/nginx/tickethub-scan.log
+maxretry = 3
+findtime = 5m
+bantime  = 6h
+
+# ------------------------------------------------------------
+# 3. nginx 限流触发过多（429）
+# ------------------------------------------------------------
+# 抢票接口限流是 10 次/秒。如果某个 IP 反复撞 429，
+# 说明它在刷接口（可能是压测，也可能是恶意）。
+[tickethub-ratelimit]
+enabled  = true
+port     = http,https
+filter   = nginx-limit-req
+logpath  = /var/log/nginx/tickethub.error.log
+maxretry = 20
+findtime = 5m
+bantime  = 30m

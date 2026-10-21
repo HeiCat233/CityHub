@@ -1147,7 +1147,7 @@ tar czf ~/tickethub-uploads-$(date +%Y%m%d).tar.gz -C /opt/tickethub uploads
 | 现象 | 可能原因 | 排查命令 | 解决 |
 |---|---|---|---|
 | 浏览器打不开，超时 | 安全组没放行 80 | 服务器上 `curl -I http://127.0.0.1/` | 若服务器内正常，去控制台放行 80 |
-| 502 Bad Gateway | 后端容器没起来 | `docker compose ps`、`logs app` | 看日志定位；常见是数据库连不上 |
+| 502 Bad Gateway | 后端容器没起来（部署瞬间最常见） | `docker compose ps`、`logs app` | 见 6.4.1：现在已有中文兜底页 + 自动重试，不会再甩英文 502 |
 | 404 Not Found | 前端文件没传到位置 | `ls /opt/tickethub/frontend/dist/index.html` | 重新上传 dist |
 | 页面能开但接口 404 | nginx rewrite 或后端路由问题 | `curl http://127.0.0.1/api/show-category/list` | 检查 nginx 配置里的 rewrite |
 | 图片全是空白 | dist 里没有 imgs 目录 | `ls /opt/tickethub/frontend/dist/imgs/` | 重新 `npm run build`（图片在 `frontend/public/imgs/`） |
@@ -1157,6 +1157,90 @@ tar czf ~/tickethub-uploads-$(date +%Y%m%d).tar.gz -C /opt/tickethub uploads
 | 抢票成功但订单列表没有 | MQ 消费失败 | `logs app \| grep -i rabbit` | 检查 rabbitmq 容器状态 |
 | `docker compose` 报权限错误 | 用户不在 docker 组 | `groups` | `sudo usermod -aG docker $USER` 后重新登录 |
 | `no space left on device` | 磁盘满 | `df -h`、`docker system df` | `docker system prune -a` 清理无用镜像 |
+
+### 6.4.1 关于 502：先分清是「部署瞬间」还是「真的挂了」
+
+**部署瞬间的 502 是正常的，不用管。**
+`docker compose up -d` 之后，nginx 已经能接请求了，但 Spring Boot 还在启动
+（连数据库、建连接池、预热 Redis 库存），这中间有 20~40 秒的空窗。
+此时请求打到 `127.0.0.1:8081` 会得到 `Connection refused`，nginx 就回 502。
+
+**怎么区分**：
+
+```bash
+# 看错误日志里的时间戳
+tail -30 /var/log/nginx/tickethub.error.log
+
+# 如果只有部署那几分钟的 502，之后没有了 → 正常
+# 如果现在还在持续刷 502 → 真的挂了，往下查
+docker compose ps
+docker compose logs --tail=80 app
+```
+
+**现在已经做的兜底**（`deploy/nginx/tickethub.conf`）：
+
+1. `proxy_next_upstream error timeout http_502 http_503 http_504` + `tries 2` + `timeout 3s`
+   → 后端刚起来的那一下会自动重试一次，多数情况直接就成功了。
+2. `error_page 502 503 504 = @tickethub_page_unavailable`（页面）
+   → 返回一个自带「3 秒后自动刷新」的中文页，而不是 nginx 那个带版本号的英文 502。
+3. API 路径单独覆盖为 `@tickethub_api_unavailable`
+   → 返回 `{"success":false,"errorMsg":"服务正在重启，请 3 秒后重试"}`，
+   前端 axios 拦截器能识别 `success:false` 并弹中文提示，不会白屏。
+
+**实测验证**（停掉 app 容器模拟）：
+
+```bash
+docker stop tickethub-app
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1/                        # 200（静态页还在）
+curl -s http://127.0.0.1/api/show-category/list                                    # 中文 JSON 提示
+docker start tickethub-app                                                          # 约 9 秒恢复
+```
+
+### 6.4.2 安全加固：80 端口开着，怎么防扫描
+
+完整原理和踩坑记录在 **`docs/LOCAL_RUN.md` 第 4.8 节**，这里只给运维速查。
+
+**三层防护**：
+
+| 层 | 文件 | 作用 |
+|---|---|---|
+| nginx | `deploy/nginx/tickethub.conf` | 扫描路径 `return 444`（断连）、`server_tokens off`、方法白名单 |
+| fail2ban | `deploy/security/jail.local` | 扫描 3 次封 6h、SSH 5 次封 2h、429 20 次封 30m |
+| 安全组 | 阿里云控制台 | 只放行 22 / 80 |
+
+**部署 fail2ban 配置**：
+
+```bash
+scp -i <key> deploy/security/jail.local              root@<IP>:/etc/fail2ban/jail.d/tickethub.local
+scp -i <key> deploy/security/tickethub-scanner.conf  root@<IP>:/etc/fail2ban/filter.d/
+
+# 服务器上
+systemctl restart fail2ban
+fail2ban-client status
+```
+
+**日常命令**：
+
+```bash
+fail2ban-client status tickethub-scanner          # 看封了谁
+fail2ban-client set tickethub-scanner unbanip IP  # 解封
+grep -E 'Ban |Unban ' /var/log/fail2ban.log | tail -20
+```
+
+**改过滤器后必须自检**（fail2ban 0.11.2 的 `<HOST>` 有边界断言坑，详见 LOCAL_RUN 4.8.4）：
+
+```bash
+fail2ban-regex /var/log/nginx/tickethub-scan.log \
+               /etc/fail2ban/filter.d/tickethub-scanner.conf
+# 必须看到 "N matched"，0 matched 就是写错了
+```
+
+**别忘了把自己 IP 加白名单**，否则演示时可能把自己封在门外：
+
+```bash
+curl https://api.ipify.org        # 查出口 IP
+# 加到 deploy/security/jail.local 的 ignoreip 后面
+```
 
 ### 6.5 内存监控
 
