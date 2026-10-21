@@ -6,8 +6,10 @@ import com.tickethub.dto.Result;
 import com.tickethub.dto.UserDTO;
 import com.tickethub.entity.TicketOrder;
 import com.tickethub.entity.TierStock;
+import com.tickethub.entity.TicketTier;
 import com.tickethub.mapper.TicketOrderMapper;
 import com.tickethub.service.ITicketOrderService;
+import com.tickethub.service.ITicketTierService;
 import com.tickethub.service.ITierStockService;
 import com.tickethub.utils.RedisConstants;
 import com.tickethub.utils.RedisIdWorker;
@@ -44,6 +46,9 @@ public class TicketOrderServiceImpl extends ServiceImpl<TicketOrderMapper, Ticke
 
     @Resource
     private ITierStockService tierStockService;
+
+    @Resource
+    private ITicketTierService ticketTierService;
 
     @Resource
     private RabbitTemplate rabbitTemplate;
@@ -127,6 +132,15 @@ public class TicketOrderServiceImpl extends ServiceImpl<TicketOrderMapper, Ticke
         TierStock stock = tierStockService.getById(order.getTierId());
         if (stock != null) {
             order.setShowId(stock.getShowId());
+        }
+        // 票价必须在这里补：MQ 消息里只带了 id/userId/tierId/showId，
+        // 不带价格。原来没补，落库的订单 price 恒为 0，
+        // 前端「我的订单」和支付金额都会显示 0 元（实测踩过）。
+        if (order.getPrice() == null || order.getPrice() <= 0) {
+            TicketTier tier = ticketTierService.getById(order.getTierId());
+            if (tier != null) {
+                order.setPrice(tier.getPrice());
+            }
         }
         order.setQuantity(1);
         order.setStatus(1); // 待支付

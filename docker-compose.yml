@@ -106,8 +106,11 @@ services:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 40s
+      # 首次启动要建库 + 导入演示数据，2核2G 上可能要 2-3 分钟。
+      # start_period 太短会让 compose 在初始化还没完成时就判定 unhealthy，
+      # 然后直接放弃启动 app（实测踩过：表数为 0、app 停在 Created 状态）。
+      retries: 30
+      start_period: 120s
 
     # 标准 500m / 精简 360m
     mem_limit: ${MYSQL_MEM_LIMIT:-500m}
@@ -154,18 +157,22 @@ services:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-tickethub}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?请在 .env 中设置 RABBITMQ_PASSWORD}
       # Erlang VM 默认会按「检测到的内存」申请，在 2G 机器上容易吃满。
+      # 这里必须用绝对值（如 128MB）而不是相对值 0.4：
+      # 相对值按检测到的内存算，若容器内检测到宿主机 2G，阈值会变成 800M，
+      # 反而超过本容器 300m 的 mem_limit，水位线还没触发就被 OOM Killer 杀掉。
       #
-      # 这里必须用 absolute（绝对值 256MB）而不是 relative：
-      # relative 0.4 是按检测到的内存算的，若容器内检测到的是宿主机 2G，
-      # 阈值会变成 800M，反而超过本容器 400m 的 mem_limit，
-      # 结果水位线还没触发，容器就已被 OOM Killer 杀掉了。
-      # absolute 256MB 明确且可控：达到后 RabbitMQ 阻塞生产者而不是崩溃。
-      # 水位线可用 .env 的 RABBITMQ_WATERMARK 覆盖：标准 256MB / 精简 128MB。
-      # 精简值下队列堆积到 128MB 会阻塞生产者（而不是崩溃），演示场景够用。
-      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit vm_memory_high_watermark.absolute ${RABBITMQ_WATERMARK:-256MB}"
+      # ⚠️ RabbitMQ 3.12 起，下面两种环境变量写法都会让容器**直接退出**（实测踩过）：
+      #   1) RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="-rabbit vm_memory_high_watermark.absolute 256MB"
+      #      → Erlang 把点号当记录语法，报 syntax error before: '.'
+      #   2) RABBITMQ_VM_MEMORY_HIGH_WATERMARK=128MB
+      #      → 报 "is set but deprecated" 然后拒绝启动
+      # 官方现在只认配置文件，所以改成挂载 deploy/rabbitmq/rabbitmq.conf。
+      # 要调水位就改那个文件里的 vm_memory_high_watermark.absolute。
 
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      # 内存水位配置（3.12+ 必须用配置文件，环境变量已弃用）
+      - ./deploy/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/10-tickethub.conf:ro
 
     # 标准 400m / 精简 300m
     mem_limit: ${RABBITMQ_MEM_LIMIT:-400m}

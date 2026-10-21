@@ -23,6 +23,9 @@
 #
 # 重要：本脚本不会删除数据卷。要清库请手动执行
 #   docker compose down -v
+#
+# 前置：项目目录里必须有 src/main/resources/db/tickethub.sql（建表脚本）。
+# 缺了它 MySQL 会跳过初始化，库是空的。
 # ============================================================
 
 set -Eeuo pipefail
@@ -242,6 +245,24 @@ if [[ "${MEM_MB}" -lt 3072 ]] && ! grep -q '^APP_MEM_LIMIT=' "${ENV_FILE}" 2>/de
   fi
 fi
 
+# RabbitMQ 内存水位：把 .env 里的 RABBITMQ_WATERMARK 写进配置文件。
+#
+# 为什么不用环境变量：RabbitMQ 3.12 起
+#   RABBITMQ_VM_MEMORY_HIGH_WATERMARK 会报 "is set but deprecated" 直接退出；
+#   RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS 里带点号会被 Erlang 当记录语法报错。
+# 所以改成挂载配置文件，这里负责把 .env 的值同步进去。
+RMQ_CONF="${APP_DIR}/deploy/rabbitmq/rabbitmq.conf"
+if [[ -f "${RMQ_CONF}" ]]; then
+  WATERMARK="$(grep -E '^RABBITMQ_WATERMARK=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  WATERMARK="${WATERMARK:-256MB}"
+  if grep -q '^vm_memory_high_watermark.absolute' "${RMQ_CONF}"; then
+    sed -i "s|^vm_memory_high_watermark.absolute.*|vm_memory_high_watermark.absolute = ${WATERMARK}|" "${RMQ_CONF}"
+    ok "RabbitMQ 内存水位：${WATERMARK}"
+  fi
+else
+  warn "缺少 ${RMQ_CONF}，RabbitMQ 将使用默认内存水位（2G 机器上可能被 OOM）。"
+fi
+
 # ============================================================
 # 第 5 步：准备前端与上传目录
 # ============================================================
@@ -272,6 +293,24 @@ if ! compgen -G "${APP_DIR}/target/ticket-hub-*.jar" >/dev/null; then
   err "请在本地执行 mvn -DskipTests clean package，再上传 target 目录。"
   exit 1
 fi
+
+# 建表脚本检查。
+#
+# docker-compose.yml 把 ./src/main/resources/db/tickethub.sql 绑定挂载到
+# /docker-entrypoint-initdb.d/。如果宿主机上这个文件不存在，Docker 不会报错，
+# 而是自动创建一个**同名空目录**——MySQL 启动时看不到 .sql 文件，静默跳过初始化。
+# 结果是容器 healthy、库存在、但一张表都没有，app 启动后到处报「表不存在」。
+# 这个坑实测踩过（2026-10-21），必须在启动前拦住。
+INIT_SQL="${APP_DIR}/src/main/resources/db/tickethub.sql"
+if [[ ! -f "${INIT_SQL}" ]]; then
+  err "未找到建表脚本：${INIT_SQL}"
+  if [[ -d "${INIT_SQL}" ]]; then
+    err "（该路径现在是一个目录——这是 Docker 绑定挂载缺失文件时自动创建的，删掉它再传文件）"
+  fi
+  err "请上传：scp -r src/main/resources/db root@<IP>:${APP_DIR}/src/main/resources/"
+  exit 1
+fi
+ok "建表脚本就绪：${INIT_SQL}"
 
 # ============================================================
 # 第 6 步：安装 nginx 配置
@@ -327,6 +366,26 @@ fi
 
 log "构建并启动容器（首次会拉取 MySQL/Redis/RabbitMQ 镜像，需要几分钟）……"
 docker compose up -d --build --remove-orphans
+
+# RabbitMQ 容器「已启动」不等于「已能收消息」。
+# app 的消费者线程在 RabbitMQ 未就绪时会反复重连，期间投递的消息
+# 会堆在队列里不消费（看起来像「抢票成功但订单查不到」）。
+# 所以等 RabbitMQ 真正 ready 后，再重启一次 app，确保消费者已连上。
+log "等待 RabbitMQ 就绪，然后重启 app 以绑定消费者……"
+RMQ_READY=0
+for _ in $(seq 1 40); do
+  if docker exec tickethub-rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; then
+    RMQ_READY=1
+    break
+  fi
+  sleep 3
+done
+if [[ "${RMQ_READY}" -eq 1 ]]; then
+  docker compose restart app >/dev/null 2>&1 || true
+  ok "RabbitMQ 已就绪，app 已重启（消费者已绑定）。"
+else
+  warn "RabbitMQ 在 120 秒内未就绪，稍后请手动执行：docker compose restart app"
+fi
 
 ok "容器已启动，等待服务就绪……"
 

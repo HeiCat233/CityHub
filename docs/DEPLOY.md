@@ -114,7 +114,7 @@
 | JVM（Spring Boot） | 默认堆 ≈ 物理内存的 1/4，加元空间/线程栈可达 800M+ | 堆 512M | `JAVA_OPTS=-Xmx512m` + `mem_limit: 800m` |
 | MySQL 8 | buffer pool 默认 128M + performance_schema，常驻 600M+ | 约 350M | `--innodb-buffer-pool-size=128M` `--performance-schema=OFF` + `mem_limit: 500m` |
 | Redis 7 | 默认无上限，可吃光内存 | 128M | `--maxmemory 128mb` + `mem_limit: 256m` |
-| RabbitMQ | Erlang VM 默认按物理内存申请 | 约 300M | `vm_memory_high_watermark 0.4` + `mem_limit: 400m` |
+| RabbitMQ | Erlang VM 默认按物理内存申请 | 约 300M | `RABBITMQ_VM_MEMORY_HIGH_WATERMARK=256MB` + `mem_limit: 400m` |
 | 系统 + Docker | 200~300M | — | — |
 
 **不加限制会发生什么**：Linux 的 OOM Killer 会挑「占内存最多」的进程杀掉，

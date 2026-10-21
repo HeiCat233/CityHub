@@ -592,6 +592,120 @@ docker compose -f docker-compose.local.yml up -d
 
 停：`docker compose -f docker-compose.local.yml down`（数据保留）
 
+## 第 4.7 节 服务器上踩到的三个真 Bug（2026-10-21 实录）
+
+这三个都是**只在真实部署时才会暴露**、本地因为缓存/已有数据而看不出来的问题。全部已修复并推送。
+
+### 4.7.1 `src/main/resources/db/tickethub.sql` 没上传 → 数据库是空的
+
+`docker-compose.yml` 把建表脚本绑定挂载到 `/docker-entrypoint-initdb.d/`。
+如果宿主机上这个文件**不存在**，Docker 不会报错，而是自动创建一个**同名空目录**：
+
+```
+/opt/tickethub/src/main/resources/db/tickethub.sql   ← 变成了目录（drwxr-xr-x）
+```
+
+MySQL 启动时在 initdb 目录里看不到 `.sql` 文件，**静默跳过初始化**。结果：
+
+- 容器状态 healthy
+- 库 `tickethub` 存在
+- 但 `information_schema` 里表数量 = **0**
+- app 启动后所有业务接口报「表不存在」
+
+**判断方法**：
+
+```bash
+ls -la /opt/tickethub/src/main/resources/db/
+# 如果 tickethub.sql 显示 drwxr-xr-x 就是踩坑了，应该是 -rw-r--r--
+
+PW=$(grep '^MYSQL_ROOT_PASSWORD=' /opt/tickethub/.env | cut -d= -f2)
+docker exec tickethub-mysql mysql -uroot -p"$PW" -N -e \
+  "select count(*) from information_schema.tables where table_schema='tickethub';"
+# 期望 11
+```
+
+**修复**：
+
+```bash
+rm -rf /opt/tickethub/src/main/resources/db/tickethub.sql   # 删掉那个假目录
+# 本地重新上传
+scp -i <key> src/main/resources/db/tickethub.sql root@<IP>:/opt/tickethub/src/main/resources/db/
+# 重建数据卷（会清空已有订单）
+cd /opt/tickethub && docker compose down --remove-orphans
+docker volume rm tickethub_mysql-data
+docker compose up -d
+```
+
+`deploy/deploy.sh` 现在会在启动前检查这个文件，缺了直接报错退出，不会再静默跳过。
+
+### 4.7.2 RabbitMQ 内存水位写法在 3.12 上非法 → 容器无限重启
+
+我最初写的两种写法**都会让容器直接退出**：
+
+| 写法 | 报错 |
+|---|---|
+| `RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="-rabbit vm_memory_high_watermark.absolute 256MB"` | `application_controller: syntax error before: '.'`（Erlang 把点号当记录语法） |
+| `RABBITMQ_VM_MEMORY_HIGH_WATERMARK=128MB` | `is set but deprecated` → 拒绝启动 |
+
+**正确做法**：挂载配置文件。仓库里新增了 `deploy/rabbitmq/rabbitmq.conf`：
+
+```ini
+vm_memory_high_watermark.absolute = 128MB
+```
+
+`docker-compose.yml` 里：
+
+```yaml
+volumes:
+  - rabbitmq-data:/var/lib/rabbitmq
+  - ./deploy/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/10-tickethub.conf:ro
+```
+
+`deploy.sh` 会把 `.env` 里的 `RABBITMQ_WATERMARK` 同步进这个文件。
+
+**判断方法**：
+
+```bash
+docker logs --tail 20 tickethub-rabbitmq
+# 正常应该是：Server startup complete; 4 plugins started.
+# 异常会出现：BOOT FAILED / failed_to_prepare_configuration
+```
+
+### 4.7.3 订单落库 `price=0`
+
+MQ 消息里只带 `{id, userId, tierId, showId}`，**不带票价**。
+消费端 `createTicketOrder` 原来直接 `save(order)`，`price` 字段为 null，MySQL 默认 0。
+
+结果：「我的订单」显示 0 元，支付金额也是 0。
+
+**修复**（`TicketOrderServiceImpl.createTicketOrder`）：
+
+```java
+if (order.getPrice() == null || order.getPrice() <= 0) {
+    TicketTier tier = ticketTierService.getById(order.getTierId());
+    if (tier != null) {
+        order.setPrice(tier.getPrice());
+    }
+}
+```
+
+实测：tierId=3 抢票后订单 `price=68000`（680 元），正确。
+
+### 4.7.4 还有一个「看起来像 bug 其实不是」
+
+**抢票成功但订单查不到**：RabbitMQ 起来之前，app 的消费者线程在重连，此时投递的消息**留在队列里没被消费**。
+等 RabbitMQ 恢复后，消费者会自动补消费，订单就出现了。
+
+所以部署顺序很重要：**先等 RabbitMQ 完全起来，再重启一次 app**，确保消费者已连上。
+
+```bash
+docker compose up -d rabbitmq
+sleep 30
+docker compose restart app
+```
+
+`deploy.sh` 的 `depends_on: service_started` 只保证「容器启动了」，不保证「RabbitMQ 能收消息」，所以首次部署后建议手动重启一次 app。
+
 ## 第 5 节 组员拿到项目后怎么跑（可以直接转发这段）
 
 ### 5.1 组员需要装的东西
