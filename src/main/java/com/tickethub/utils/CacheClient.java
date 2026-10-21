@@ -71,14 +71,55 @@ public class CacheClient {
 
     /**
      * 缓存击穿方案：逻辑过期 + 互斥锁 + 异步重建
+     *
+     * <p>注意：逻辑过期方案依赖「缓存已预热」。但生产环境第一次部署、
+     * 或者手动清过 Redis 之后，缓存里什么都没有，如果这里直接返回 null，
+     * 详情页就会一直报「演出不存在」。所以未命中时必须回源数据库并写入缓存，
+     * 否则这套方案在冷启动阶段是不可用的。
      */
     public <R, ID> R queryWithLogicalExpire(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
         String json = stringRedisTemplate.opsForValue().get(key);
-        if (StrUtil.isBlank(json)) {
-            // 缓存未命中：逻辑过期方案依赖预热，未命中直接返回 null
+        // 空字符串是「空值缓存」标记（防止缓存穿透），直接返回 null，不回源
+        if (json != null && StrUtil.isBlank(json)) {
             return null;
+        }
+        if (json == null) {
+            // 真正的缓存未命中（冷启动 / 清过 Redis）。
+            // 这里也要抢锁：否则首屏并发进来会同时回源数据库（等于击穿）。
+            String lockKey = RedisConstants.LOCK_SHOW_KEY + id;
+            if (tryLock(lockKey)) {
+                try {
+                    // 双检：抢到锁之前可能已经有别的线程写好缓存了
+                    String again = stringRedisTemplate.opsForValue().get(key);
+                    if (again != null) {
+                        return StrUtil.isBlank(again) ? null : parse(again, type);
+                    }
+                    R fresh = dbFallback.apply(id);
+                    if (fresh == null) {
+                        // 数据库也没有：写空值缓存，挡住后续穿透
+                        stringRedisTemplate.opsForValue()
+                                .set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+                        return null;
+                    }
+                    this.setWithLogicalExpire(key, fresh, time, unit);
+                    return fresh;
+                } finally {
+                    unLock(lockKey);
+                }
+            }
+            // 没抢到锁：短暂等一下让持锁线程写缓存，再读一次；仍没有就直接回源（不回写）
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            String afterWait = stringRedisTemplate.opsForValue().get(key);
+            if (afterWait != null) {
+                return StrUtil.isBlank(afterWait) ? null : parse(afterWait, type);
+            }
+            return dbFallback.apply(id);
         }
         RedisData redisData = JSONUtil.toBean(json, RedisData.class);
         R r = JSONUtil.toBean((JSONObject) redisData.getData(), type);
@@ -94,7 +135,13 @@ public class CacheClient {
             CACHE_REBUILD_EXECUTOR.submit(() -> {
                 try {
                     R fresh = dbFallback.apply(id);
-                    this.setWithLogicalExpire(key, fresh, time, unit);
+                    if (fresh == null) {
+                        // 数据已被删除：写空值缓存，避免后续请求继续回源
+                        stringRedisTemplate.opsForValue()
+                                .set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+                    } else {
+                        this.setWithLogicalExpire(key, fresh, time, unit);
+                    }
                 } catch (Exception e) {
                     log.error("缓存重建失败, key={}", key, e);
                 } finally {
@@ -113,5 +160,11 @@ public class CacheClient {
 
     private void unLock(String key) {
         stringRedisTemplate.delete(key);
+    }
+
+    /** 把逻辑过期结构里的 data 解析成目标类型 */
+    private <R> R parse(String json, Class<R> type) {
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        return JSONUtil.toBean((JSONObject) redisData.getData(), type);
     }
 }

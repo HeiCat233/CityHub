@@ -166,7 +166,8 @@ public void receivedA(Message message, Channel channel) {
 核心思想：**热点数据永不物理过期，把过期时间包在 value 里（逻辑过期）**，过期了也不阻塞请求：
 
 ```
-查Redis → 没数据直接返回null（所以必须先用测试类预热缓存!）
+查Redis → 空字符串(空值缓存) → 返回 null(挡住穿透)
+       → key 不存在(冷启动) → 回源数据库 → 写入逻辑过期缓存 → 返回
        → 有数据,解析出 expireTime
        → 未到期：直接返回旧数据（性能最好,AP思路）
        → 已到期：tryLock("lock:shop:"+id) 抢到锁的线程,丢进独立线程池异步查库重建缓存
@@ -335,7 +336,7 @@ CityHub/
 
 ### 3.6 test 目录
 
-- `ShopCacheTest.testSaveShopCache`：把全部商铺写入 Redis（逻辑过期格式）——**每次重启/清空 Redis 后必须先跑它**，否则查店铺一律"不存在"。
+- `ShowCacheTest.testSaveShowCache`：把全部演出写入 Redis（逻辑过期格式）。**现在不再是必需前置**：`CacheClient.queryWithLogicalExpire` 在 key 不存在时会自动回源数据库并写入缓存。这个测试类只用于「想提前把全部演出灌进缓存、让首个请求也走缓存」的场景。
 - `VoucherOrderControllerTest.testMultiThreadSeckill`：模拟 1000 并发秒杀（MockMvc + CountDownLatch），先批量注册用户拿 token 写进 `tokens.txt`，再放行并发——验证"不超卖、一人一单"。
 
 ---
@@ -380,7 +381,7 @@ CityHub/
 | 1 | **README 与代码严重不符**（Boot 3.0/RocketMQ/Caffeine/压测数据均为声称，代码无） | README.md | 答辩/面试被追问会露馅，改造时重写 |
 | 2 | **`proxy` 字段从未初始化**，`handleVoucherOrder()` 一旦被调用立刻 NPE（当前恰好无人调用它） | `VoucherOrderServiceImpl.java:178-202` | 定时炸弹；改造时应清理 |
 | 3 | **seckill.lua 末尾 `XADD stream.orders` 残留**：每次成功秒杀都往 Redis Stream 写一条无人消费的消息 | `seckill.lua:37` | Redis 内存缓慢增长，且是旧方案痕迹 |
-| 4 | **逻辑过期重建后删错 key**：重建线程 finally 里 `unLock(key)` 删除的是缓存 key 而不是锁 key（应为 `unLock(lockKey)`），导致刚重建的缓存被删掉、锁要等 10s 自然过期 | `CacheClient.java:113` | 缓存命中率异常，属于真 Bug |
+| 4 | ~~逻辑过期重建后删错 key~~ **已修复**：`unLock(lockKey)` 释放的是锁而不是缓存 | `CacheClient.java` | 已于 2026-10-09 改造中修复 |
 | 5 | **死信队列消费者会重复落库**：`receivedD` 与 `receivedA` 做同样的 save+扣库存，若消息真进入 QD（消费者宕机超 10s）会重复下单、重复扣库存 | `SeckillVoucherListener.java:52-66` | 消费端无幂等保障 |
 | 6 | **秒杀时间窗口校验缺失**：Lua 只判断库存/已购，起售/截止时间校验在注释掉的旧代码里 | `VoucherOrderServiceImpl.java:248-291` | 未开票也能抢 |
 | 7 | **MySQL root 密码明文提交**（290390） | `application.yaml:15` | 安全问题；仓库公开可见 |
@@ -464,7 +465,8 @@ CityHub/
 
 #### 待办
 
-- **RabbitMQ 环境验证**：本机未安装 RabbitMQ 且 Docker 守护进程未能启动，抢票接口的 MQ 投递/消费链路尚未在本机端到端跑通（代码已通过编译，逻辑与压测已验证）
+- ~~RabbitMQ 环境验证~~ **已完成**：本地 Docker 编排（`docker-compose.local.yml`）已端到端跑通「验证码 → 登录 → 抢票 → MQ 异步落单 → 查我的订单」全链路（2026-10-21）。
+- **缓存冷启动**（2026-10-21 修复）：`CacheClient.queryWithLogicalExpire` 在 key 不存在时会自动回源数据库并写入逻辑过期缓存，不再依赖手动跑 `ShowCacheTest` 预热。此前「点开演出详情显示演出不存在」就是这个问题。
 - 缺失的 4 个技术点按约定暂不实现，列在 6.6
 
 ---
@@ -506,8 +508,10 @@ mysql -uroot -p < src/main/resources/db/hmdp.sql
 # 4. 启动应用
 mvn spring-boot:run        # 端口 8081
 
-# 5. 预热店铺缓存（重要!逻辑过期方案没有预热查不到数据）
-#    跑 src/test/java/com/hmdp/ShopCacheTest.java
+# 5. 演出缓存预热（可选）
+#    跑 src/test/java/com/tickethub/ShowCacheTest.java
+#    说明：CacheClient 现在会在 key 不存在时自动回源数据库，
+#    不跑这个测试也能正常打开详情页，只是首个请求多查一次库。
 
 # 6. 接口调试（仓库无前端页面）
 #    Postman/Apifox 手动调；验证码看后端 debug 日志：
