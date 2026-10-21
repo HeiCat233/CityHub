@@ -120,6 +120,35 @@
 **不加限制会发生什么**：Linux 的 OOM Killer 会挑「占内存最多」的进程杀掉，
 通常是 MySQL 或 Java，表现为「容器莫名其妙重启」「日志里有 `Killed`」。
 
+### 0.4.1 两档配置：标准档 / 精简档
+
+上表是**标准档**（4G 及以上独占机器）。如果你的机器是 2核2G，而且已经跑着别的服务
+（本项目就是：同机有海豹骰娘 ×2 + NapCat ×2，常驻约 606MB），必须用**精简档**：
+
+| 项 | 标准档 | 精简档 | 差别 |
+|---|---|---|---|
+| `APP_MEM_LIMIT` | 800m | **512m** | JVM 堆 512M → 384M |
+| `MYSQL_MEM_LIMIT` | 500m | **360m** | buffer pool 128M → 48M |
+| `REDIS_MEM_LIMIT` | 256m | **160m** | maxmemory 128mb → 48mb |
+| `RABBITMQ_MEM_LIMIT` | 400m | **300m** | 水位 256MB → 128MB |
+| `JAVA_OPTS` | `-Xms256m -Xmx512m` | `-Xms192m -Xmx384m` | 元空间 160M → 128M |
+| mem_limit 合计 | 1956m | **1332m** | 省 624m |
+| 实测实际占用 | 1230–1560m | **800–990m** | 省 400–570m |
+
+**怎么切**：一条命令（幂等，会自动备份 `.env`）：
+
+```bash
+cd /opt/tickethub
+bash deploy/apply-compact.sh
+docker compose up -d --force-recreate
+```
+
+`deploy/deploy.sh` 在检测到物理内存 < 3GB 且 `.env` 里没有 `APP_MEM_LIMIT` 时，
+会**自动**调用这个脚本，不需要你手动判断。
+
+> `mem_limit` 是上限保险丝，不是实际占用。容器不会一上来就吃掉上限值。
+> 真正决定能不能跑的是「实际占用之和 ≤ 物理内存 + 可接受的 swap」。
+
 **为什么还要建 swap**：swap 是磁盘上的虚拟内存。物理内存不够时，系统把不常用的内存页
 换到磁盘，避免直接杀进程。代价是慢（磁盘比内存慢几个数量级），所以 `vm.swappiness=10`
 表示「尽量别用 swap，只在快撑不住时兜底」。2G 机器上加 2G swap 是性价比最高的保命手段。
@@ -1411,13 +1440,21 @@ cd D:\develop\git\CityHub
 mvn -DskipTests clean package
 cd frontend; npm run build; cd ..
 
-$IP = "<ECS公网IP>"; $KEY = "<密钥路径>"
-ssh -i $KEY ubuntu@$IP "sudo mkdir -p /opt/tickethub && sudo chown -R ubuntu:ubuntu /opt/tickethub"
-scp -i $KEY -r docker-compose.yml Dockerfile.runtime deploy src pom.xml ubuntu@$IP:/opt/tickethub/
-scp -i $KEY -r target ubuntu@$IP:/opt/tickethub/
-scp -i $KEY -r frontend/dist ubuntu@$IP:/opt/tickethub/frontend/
-ssh -i $KEY ubuntu@$IP "sudo bash /opt/tickethub/deploy/deploy.sh"
+$IP = "8.148.238.219"; $KEY = "D:\develop\dice\maoDice.pem"
+ssh -i $KEY root@$IP "mkdir -p /opt/tickethub/target /opt/tickethub/frontend"
+scp -i $KEY docker-compose.yml Dockerfile.runtime root@$IP:/opt/tickethub/
+scp -i $KEY target\ticket-hub-*.jar root@$IP:/opt/tickethub/target/
+scp -i $KEY -r frontend\dist root@$IP:/opt/tickethub/frontend/
+scp -i $KEY -r deploy root@$IP:/opt/tickethub/
+ssh -i $KEY root@$IP "cd /opt/tickethub && bash deploy/deploy.sh"
 ```
+
+> **为什么只传 jar 不传 src/pom.xml**：服务器用 `Dockerfile.runtime`，它只 `COPY target/*.jar`，
+> 不在服务器上编译。2核2G 跑 Maven 构建极易 OOM，而且要多等 10 分钟。
+>
+> **`deploy.sh` 会自动做的事**：装 Docker/nginx → 生成 `.env`（随机密码）→
+> 检测内存 < 3GB 时自动切精简档 → 起 4 个容器 → 装 nginx 站点配置 → 健康检查。
+> 首次大约 3–5 分钟（主要是拉镜像），之后重跑只重启容器（20 秒）。
 
 **验证**：
 

@@ -139,8 +139,10 @@ CityHub/
 ├── deploy/            # 一键部署脚本、nginx 配置、.env 模板
 ├── Dockerfile         # 完整构建版（服务器内编译，备用）
 ├── Dockerfile.runtime # 服务器实际使用：只运行本地构建好的 jar
-├── docker-compose.yml
-└── docs/              # PROJECT_GUIDE.md（项目讲解）、DEPLOY.md（部署手册）
+├── docker-compose.yml       # 生产编排（精简档参数可由 .env 覆盖）
+├── docker-compose.local.yml # 本地快速启动（复用已构建的 jar/dist，30 秒起）
+├── docker-compose.build.yml # 本地完整构建（组员用，容器内编译）
+└── docs/              # LOCAL_RUN / DEPLOY / PRE_DEPLOY_CHECK / PROJECT_GUIDE
 ```
 
 ## 部署到服务器
@@ -156,22 +158,27 @@ CityHub/
 **快速部署（本地构建 → 上传 → 一键脚本）**：
 
 ```powershell
-# 1. 本地构建（服务器是 2核2G，不在服务器上编译）
+# 1. 本地构建（服务器是 2核2G，不在服务器上编译，否则必 OOM）
 mvn -DskipTests clean package
 cd frontend; npm run build; cd ..
 
-# 2. 上传到服务器
-$IP = "<ECS公网IP>"; $KEY = "<密钥路径>"
-ssh -i $KEY ubuntu@$IP "sudo mkdir -p /opt/tickethub && sudo chown -R ubuntu:ubuntu /opt/tickethub"
-scp -i $KEY -r docker-compose.yml Dockerfile.runtime deploy src pom.xml ubuntu@$IP:/opt/tickethub/
-scp -i $KEY -r target ubuntu@$IP:/opt/tickethub/
-scp -i $KEY -r frontend/dist ubuntu@$IP:/opt/tickethub/frontend/
+# 2. 上传到服务器（jar 必须落在 target/ 下）
+$IP = "8.148.238.219"; $KEY = "D:\develop\dice\maoDice.pem"
+ssh -i $KEY root@$IP "mkdir -p /opt/tickethub/target /opt/tickethub/frontend"
+scp -i $KEY docker-compose.yml Dockerfile.runtime root@$IP:/opt/tickethub/
+scp -i $KEY target\ticket-hub-*.jar root@$IP:/opt/tickethub/target/
+scp -i $KEY -r frontend\dist root@$IP:/opt/tickethub/frontend/
+scp -i $KEY -r deploy root@$IP:/opt/tickethub/
 
 # 3. 服务器上一键部署（装 Docker/nginx、建 swap、生成密码、起容器、健康检查）
-ssh -i $KEY ubuntu@$IP "sudo bash /opt/tickethub/deploy/deploy.sh"
+ssh -i $KEY root@$IP "cd /opt/tickethub && bash deploy/deploy.sh"
 ```
 
 访问 `http://<ECS公网IP>/` 即可。前置条件：阿里云安全组放行 **22、80** 端口。
+
+**2核2G / 同机已有其他服务**：`deploy.sh` 检测到内存 < 3GB 会自动切「精简档」
+（四容器实际占用约 800–990MB）。也可手动执行 `bash deploy/apply-compact.sh`。
+详见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 第 0.4.1 节。
 
 ## 演示脚本（答辩用）
 
@@ -185,8 +192,12 @@ ssh -i $KEY ubuntu@$IP "sudo bash /opt/tickethub/deploy/deploy.sh"
 
 ## 文档
 
-- [`docs/PROJECT_GUIDE.md`](docs/PROJECT_GUIDE.md) — 项目讲解、核心链路逐行分析、技术点核对、风险清单、部署方案
-- [`docs/DEPLOY.md`](docs/DEPLOY.md) — **部署手册**：架构原理、手动部署 8 步、自动部署脚本、运维排错
+| 文档 | 内容 | 什么时候看 |
+|---|---|---|
+| [`docs/LOCAL_RUN.md`](docs/LOCAL_RUN.md) | 本地一键启动、组员协作、Docker 镜像盘、手动清单 | **第一次跑起来** |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | 架构原理、手动部署 8 步、自动部署、运维排错 | 要上服务器时 |
+| [`docs/PRE_DEPLOY_CHECK.md`](docs/PRE_DEPLOY_CHECK.md) | 部署前体检清单、内存账、回滚预案 | 上服务器前 |
+| [`docs/PROJECT_GUIDE.md`](docs/PROJECT_GUIDE.md) | 项目讲解、核心链路逐行分析、技术点核对、风险清单 | 答辩 / 简历 |
 
 ## License
 

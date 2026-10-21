@@ -231,6 +231,17 @@ else
   warn "  sudo grep MYSQL_ROOT_PASSWORD ${ENV_FILE}"
 fi
 
+# 小内存机器（<3GB）自动切到精简档，避免和同机其他服务抢内存被 OOM。
+# 已经手动配过（.env 里有 APP_MEM_LIMIT）就不覆盖。
+if [[ "${MEM_MB}" -lt 3072 ]] && ! grep -q '^APP_MEM_LIMIT=' "${ENV_FILE}" 2>/dev/null; then
+  warn "检测到物理内存 ${MEM_MB} MB（<3GB），自动应用精简档内存配置。"
+  if [[ -x "${APP_DIR}/deploy/apply-compact.sh" ]] || [[ -f "${APP_DIR}/deploy/apply-compact.sh" ]]; then
+    APP_DIR="${APP_DIR}" bash "${APP_DIR}/deploy/apply-compact.sh" || warn "精简档脚本执行失败，继续用标准档（可能吃 swap）。"
+  else
+    warn "缺少 deploy/apply-compact.sh，跳过精简档。若内存吃紧请手动添加 8 行内存参数。"
+  fi
+fi
+
 # ============================================================
 # 第 5 步：准备前端与上传目录
 # ============================================================

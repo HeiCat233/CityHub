@@ -14,17 +14,19 @@
 |---|---|---|---|
 | **A1 Docker 一键**（推荐先做） | 装 Docker Desktop，跑一条命令 | 装 Docker Desktop，跑同一条命令 | 现在：自己测 + 组员本地跑 |
 | A2 传统本地环境 | 装 JDK 8 + Maven + Node + MySQL + Redis + RabbitMQ | 全部装一遍 | 不推荐，容易卡在环境上 |
-| **B 直接上服务器** | 先给 ECS 升配到 4G，再部署 | **什么都不用装**，打开浏览器就行 | 答辩前、要给老师看的时候 |
+| **B 直接上服务器** | 精简档部署（不必升配），见 4.1.1 | **什么都不用装**，打开浏览器就行 | 答辩前、要给老师看的时候 |
 
 **推荐顺序：A1 → 验证通过 → B。**
 
 原因：本地跑通能确认「代码本身没问题」，上服务器时如果出问题，就只剩环境问题，排查范围小一半。
 反过来直接上服务器，一旦打不开，你分不清是代码错、配置错、还是服务器资源不够。
 
-> ⚠️ **B 路线有一个硬前提**：你打算用的那台海豹骰娘服务器目前**可用内存只有 912MB**，
-> TicketHub 需要 1200–1500MB，**直接部署会在抢票演示时 OOM**。
-> 必须先按 [PRE_DEPLOY_CHECK.md](./PRE_DEPLOY_CHECK.md) 第 6 节升配到 2核4G，或者换一台机器。
-> 详见本文第 4 节。
+> ⚠️ **B 路线的内存前提（已解决，不必升配）**：
+> 那台海豹骰娘服务器物理内存 1736MB，当前可用约 910MB，上面已经跑着 4 个容器（骰娘 ×2 + NapCat ×2）。
+> 按「标准档」直接部署会在抢票演示时 OOM；**按「精简档」部署实测可行**：
+> 四个容器实际占用约 800–990MB，配合已有的 4G swap，最多吃 20–100MB swap，演示完全够用。
+> 操作见本文 **4.1.1**（一条 `bash deploy/apply-compact.sh`）。
+> 如果以后要做正式对外服务，再考虑升配到 2核4G（见 [PRE_DEPLOY_CHECK.md](./PRE_DEPLOY_CHECK.md) 第 6 节路线 A）。
 
 ---
 
@@ -66,26 +68,22 @@ RabbitMQ ❌ 没装
 
 ## 第 2 节 路线 A1：Docker 一键跑起来（推荐）
 
-### 2.1 前置：装 Docker Desktop，并且把镜像位置改到 D 盘
+### 2.1 前置：Docker Desktop 状态（你这台机器已经配好了）
 
-你电脑上 **Docker Desktop 已安装但守护进程没起来**（`docker info` 报管道不存在）。
-先做这三件事：
+**已确认的现状，不用再改设置**：
 
-1. **启动 Docker Desktop**
-   开始菜单搜 "Docker Desktop" → 打开 → 等右下角鲸鱼图标变成「running」。
-   首次启动可能要 1–3 分钟，Windows 会提示启用 WSL2，同意即可。
+```
+镜像/容器数据盘：D:\develop\docker\DockerDesktopWSL\disk\docker_data.vhdx   （17.5GB，在 D 盘）
+发行版数据盘：   D:\develop\docker\DockerDesktopWSL\main\ext4.vhdx           （0.1GB）
+Docker 版本：    29.5.3，后端 linux，WSL2 正常
+```
 
-2. **把镜像存储位置改到 D 盘**（你要求不占 C 盘）
-   Docker Desktop → 右上角齿轮 **Settings** → **Resources** → **Advanced**
-   → **Disk image location** → 改成 `D:\develop\docker\data`
-   → **Apply & restart**。
+也就是说 **Docker 已经在用 D 盘，不会占 C 盘**。你只需要：
 
-   > 为什么必须改：默认位置是
-   > `C:\Users\60143\AppData\Local\Docker\wsl\disk\docker_data.vhdx`，
-   > 这个项目 4 个镜像加起来约 **2.5GB**，加上 MySQL 数据会持续增长。
-   > 改之前如果已经有数据，Docker 会提示迁移，选「Move」。
+1. **启动 Docker Desktop**（如果右下角鲸鱼图标不是绿色 running）
+   开始菜单搜 "Docker Desktop" → 打开 → 等 1–3 分钟。
 
-3. **确认能连上**
+2. **确认能连上**
 
 ```powershell
 docker info --format '{{.ServerVersion}} | {{.OSType}}'
@@ -397,6 +395,39 @@ rabbitmq  约 180MB
 **不建议**为了省内存去改业务代码（比如把 MQ 去掉改成同步下单），
 那样答辩时「为什么用消息队列」就讲不通了。
 
+### 4.1.3 Docker 镜像目录确认（你问的 D:\develop\docker\DockerDesktopWSL）
+
+**结论：你已经配置好了，不用动。** 实测：
+
+```
+D:\develop\docker\DockerDesktopWSL\disk\docker_data.vhdx   17.50 GB   ← 镜像/容器数据在这里
+D:\develop\docker\DockerDesktopWSL\main\ext4.vhdx           0.10 GB   ← 发行版数据
+docker info → DockerRootDir = /var/lib/docker（容器内路径，实际落在上面那个 vhdx）
+```
+
+也就是说：`docker pull` 下来的镜像、容器可写层、compose 建的卷，**全部写在 D 盘的 vhdx 里，不占 C 盘**。
+
+想自己复查，两条命令：
+
+```powershell
+# 1. 确认 vhdx 在 D 盘，并且有多大
+Get-ChildItem D:\develop\docker\DockerDesktopWSL -Recurse -Filter *.vhdx |
+  Select-Object FullName, @{n='GB';e={[math]::Round($_.Length/1GB,2)}}
+
+# 2. 确认 Docker 实际用的是哪块盘（看 vhdx 的修改时间是否在变即可）
+docker system df
+```
+
+**唯一要注意的**：Docker Desktop 里那个「Disk image location」一旦改过，就不要再在设置里点 "Reset to default" 或 "Clean / Purge data"，否则会重建到 C 盘。当前状态是健康的。
+
+**清理磁盘**（只在空间不够时做，会删掉没用的镜像/构建缓存，不动容器数据）：
+
+```powershell
+docker system df                 # 先看占用
+docker builder prune -f          # 清构建缓存（最安全）
+docker image prune -a -f         # 清没被容器引用的镜像（谨慎）
+```
+
 ### 4.2 升配后重新体检
 
 **如果走精简档，跳过本节；如果升配了，必须重跑。**
@@ -516,6 +547,51 @@ docker compose restart app
 
 ---
 
+## 第 4.6 节 「太麻烦的地方」手动清单（省算力版）
+
+这一节只列**必须你亲手点、我替你做不了**的动作。其余全部可以一条命令搞定。
+
+| # | 在哪做 | 要做什么 | 大概耗时 | 为什么我做不了 |
+|---|---|---|---|---|
+| 1 | 阿里云控制台 → ECS → 安全组 | 确认入方向放行 `22`、`80`；把 `0.0.0.0/0` 全端口那条规则删掉 | 2 分钟 | 需要你的阿里云账号登录态 |
+| 2 | 阿里云控制台 → ECS → 实例 | 决定：精简档直接跑（不花钱）或 升配 2核4G（停机 3–5 分钟） | 1 分钟决定 | 涉及计费 |
+| 3 | 本地 PowerShell | 确认 `ssh -i D:\develop\dice\maoDice.pem root@8.148.238.219` 能登进去 | 30 秒 | 私钥在你机器上 |
+| 4 | 服务器（我给命令，你粘贴） | 备份骰娘：`tar czf /opt/dice-backup/pre-tickethub-$(date +%F).tar.gz -C /opt dice dice-2` | 1 分钟 | 需要你确认可以动生产数据 |
+| 5 | 本地 PowerShell | `mvn -DskipTests package`（约 1–2 分钟） | 2 分钟 | 你机器上有 Maven |
+| 6 | 本地 PowerShell | `cd frontend; npm run build`（约 30 秒） | 1 分钟 | 你机器上有 Node |
+
+**除此之外的 8 个步骤（装 Docker、写 .env、起容器、装 nginx、健康检查）全部由 `deploy/deploy.sh` 或我远程执行完成。**
+
+### 一键走完（你只粘贴这一段）
+
+本地构建 + 上传 + 服务器部署，三段命令：
+
+```powershell
+# ① 本地构建（在 D:\develop\git\CityHub）
+mvn -DskipTests package
+cd frontend; npm run build; cd ..
+
+# ② 上传产物（jar 必须落在 target/ 下，deploy.sh 和 Dockerfile.runtime 都按这个路径找）
+ssh -i D:\develop\dice\maoDice.pem root@8.148.238.219 "mkdir -p /opt/tickethub/target /opt/tickethub/frontend"
+scp -i D:\develop\dice\maoDice.pem target\ticket-hub-*.jar root@8.148.238.219:/opt/tickethub/target/
+scp -i D:\develop\dice\maoDice.pem -r frontend\dist root@8.148.238.219:/opt/tickethub/frontend/
+scp -i D:\develop\dice\maoDice.pem docker-compose.yml Dockerfile.runtime root@8.148.238.219:/opt/tickethub/
+scp -i D:\develop\dice\maoDice.pem -r deploy root@8.148.238.219:/opt/tickethub/
+
+# ③ 服务器上一键（会自动装 Docker/nginx、生成 .env、起容器、装 nginx 配置）
+ssh -i D:\develop\dice\maoDice.pem root@8.148.238.219 "cd /opt/tickethub && bash deploy/deploy.sh"
+```
+
+### 如果你只想先本地验证，不想碰服务器
+
+```powershell
+cd D:\develop\git\CityHub
+docker compose -f docker-compose.local.yml up -d
+# 等 40 秒，然后浏览器打开 http://localhost:8080
+```
+
+停：`docker compose -f docker-compose.local.yml down`（数据保留）
+
 ## 第 5 节 组员拿到项目后怎么跑（可以直接转发这段）
 
 ### 5.1 组员需要装的东西
@@ -585,18 +661,19 @@ docker compose -f docker-compose.local.yml up -d mysql redis rabbitmq
 | 维度 | 本地 Docker | 直接上服务器 |
 |---|---|---|
 | 组员门槛 | 要装 Docker（约 700MB） | 零门槛，浏览器即可 |
-| 你的一次性成本 | 10–20 分钟构建 | 升配费 + 30 分钟部署 |
-| 持续成本 | 0 | 每月服务器费用 |
+| 你的一次性成本 | 10–20 分钟构建 | 30 分钟部署（不用升配） |
+| 持续成本 | 0 | 0（复用已有 ECS） |
 | 演示稳定性 | 依赖你的笔记本 | 依赖服务器和网络 |
 | 断点调试 | 需要切传统模式 | 不能调试 |
 | 答辩加分 | 「本地能跑」 | 「已上线，扫码即用」 |
 
-**我的建议**：
+**我的建议**（按你的实际情况调整过）：
 
-1. **今天**：走 A1，先在自己电脑上跑通，录一段抢票成功的视频（防止答辩当天翻车）。
-2. **本周**：把 `docker-compose.local.yml` 发给组员，让他们各自跑一份，确认代码没问题。
-3. **答辩前 3 天**：升配 ECS → 走 B 路线部署 → 让组员用手机验证能打开。
+1. **今天**：走 A1，本机已实测跑通（5 个容器 + 抢票链路），先录一段抢票成功的视频，防止答辩当天翻车。
+2. **本周**：把 `docker-compose.build.yml` 发给组员，让他们各自跑一份，确认代码在别人机器上也没问题。
+3. **答辩前 3 天**：直接用**精简档**部署到那台 ECS（不用升配，会吃 20–100MB swap），让组员用手机验证能打开。
 4. **答辩当天**：用服务器演示（显得完整），本地留一份作为备份。
+5. **如果演示时发现卡顿**：再考虑升配 2核4G，或者临时 `docker compose stop` 掉第 2 套骰娘释放 345MB。
 
 ---
 
