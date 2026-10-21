@@ -68,7 +68,8 @@ services:
         condition: service_started
 
     # 内存上限：容器内进程组超过这个值会被 cgroup 限制（不会拖垮整机）
-    mem_limit: 800m
+    # 内存上限可用 .env 的 APP_MEM_LIMIT 覆盖：标准 800m / 精简 512m
+    mem_limit: ${APP_MEM_LIMIT:-800m}
 
     networks: [tickethub]
 
@@ -91,9 +92,9 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_general_ci
-      - --innodb-buffer-pool-size=128M
+      - --innodb-buffer-pool-size=${MYSQL_BUFFER_POOL:-128M}
       - --performance-schema=OFF
-      - --max-connections=100
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-100}
 
     volumes:
       - mysql-data:/var/lib/mysql
@@ -108,7 +109,8 @@ services:
       retries: 12
       start_period: 40s
 
-    mem_limit: 500m
+    # 标准 500m / 精简 360m
+    mem_limit: ${MYSQL_MEM_LIMIT:-500m}
     networks: [tickethub]
 
   # ---------- Redis ----------
@@ -124,19 +126,21 @@ services:
     command: >
       sh -c 'if [ -n "$$REDIS_PASSWORD" ]; then
                redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
-                 --maxmemory 128mb --maxmemory-policy volatile-lru;
+                 --maxmemory "$$REDIS_MAXMEMORY" --maxmemory-policy volatile-lru;
              else
                redis-server --appendonly yes
-                 --maxmemory 128mb --maxmemory-policy volatile-lru;
+                 --maxmemory "$$REDIS_MAXMEMORY" --maxmemory-policy volatile-lru;
              fi'
 
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-128mb}
 
     volumes:
       - redis-data:/data
 
-    mem_limit: 256m
+    # 标准 256m / 精简 160m
+    mem_limit: ${REDIS_MEM_LIMIT:-256m}
     networks: [tickethub]
 
   # ---------- RabbitMQ ----------
@@ -156,12 +160,15 @@ services:
       # 阈值会变成 800M，反而超过本容器 400m 的 mem_limit，
       # 结果水位线还没触发，容器就已被 OOM Killer 杀掉了。
       # absolute 256MB 明确且可控：达到后 RabbitMQ 阻塞生产者而不是崩溃。
-      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit vm_memory_high_watermark.absolute 256MB"
+      # 水位线可用 .env 的 RABBITMQ_WATERMARK 覆盖：标准 256MB / 精简 128MB。
+      # 精简值下队列堆积到 128MB 会阻塞生产者（而不是崩溃），演示场景够用。
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit vm_memory_high_watermark.absolute ${RABBITMQ_WATERMARK:-256MB}"
 
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
 
-    mem_limit: 400m
+    # 标准 400m / 精简 300m
+    mem_limit: ${RABBITMQ_MEM_LIMIT:-400m}
     networks: [tickethub]
 
 volumes:

@@ -1,26 +1,37 @@
 # ============================================================
-# TicketHub 本地一键启动（本人自测 + 组员协作共用）
+# TicketHub 本地「快速模式」——直接用已构建好的产物
 #
-# 目标：组员只要装了 Docker Desktop，一条命令就能跑起完整环境，
-#       不需要装 JDK / Maven / Node / MySQL / Redis / RabbitMQ。
+# 前提：本地已经执行过
+#   mvn -DskipTests package          → target/ticket-hub-0.0.1-SNAPSHOT.jar
+#   cd frontend && npm run build     → frontend/dist/
 #
-# 启动：
-#   docker compose -f docker-compose.local.yml up -d --build
-#   然后浏览器打开 http://localhost:8080
+# 启动（不编译，只拉 1 个基础镜像，30 秒内起来）：
+#   docker compose -f docker-compose.local.yml up -d
+#   浏览器 http://localhost:8080
+#
+# 改了 Java 代码 → 重新 mvn package，然后
+#   docker compose -f docker-compose.local.yml up -d --build app
+#
+# 改了前端代码 → 重新 npm run build，然后
+#   docker compose -f docker-compose.local.yml restart web
+#   （前端是挂载进容器的，改 dist 只需重启，不用重建镜像）
+#
+# 组员第一次跑（没有 jar/dist）请用：
+#   docker compose -f docker-compose.build.yml up -d --build
 #
 # 停止（保留数据）：
 #   docker compose -f docker-compose.local.yml down
 #
-# 重置数据库（清空订单、回到初始演示数据）：
+# 重置数据库：
 #   docker compose -f docker-compose.local.yml down -v
-#   docker compose -f docker-compose.local.yml up -d --build
+#   docker compose -f docker-compose.local.yml up -d
 #
 # 端口说明（全部避开本机常见占用）：
 #   8080  -> 网站首页
 #   18081 -> 后端直连（调试用，正常走 8080/api）
 #   13306 -> MySQL（本机已有 MySQL80 占了 3306，所以错开）
 #   16379 -> Redis
-#   15672 -> RabbitMQ 管理台（guest/guest）
+#   15672 -> RabbitMQ 管理台（tickethub / tickethub_local_mq）
 # ============================================================
 
 services:
@@ -28,7 +39,9 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile
+      # 只 COPY jar，不在容器里跑 Maven：2 核机器编译会 OOM，
+      # 本机虽然有 32G，但编译一次要 3-8 分钟，没必要。
+      dockerfile: Dockerfile.runtime
     image: tickethub-app:local
     container_name: tickethub-local-app
     restart: unless-stopped
@@ -74,10 +87,9 @@ services:
 
   # ---------- 前端 + nginx ----------
   web:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    image: tickethub-web:local
+    # 不构建：直接用官方 nginx 镜像，把 dist 挂载进去。
+    # 好处：改前端只需重新 npm run build + restart，不用重建镜像。
+    image: nginx:1.27-alpine
     container_name: tickethub-local-web
     restart: unless-stopped
 
@@ -85,6 +97,10 @@ services:
       - "8080:80"
 
     volumes:
+      # 前端产物（本地 npm run build 生成）
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      # 容器内 nginx 站点配置
+      - ./frontend/nginx.local.conf:/etc/nginx/conf.d/default.conf:ro
       # 与 app 共用上传目录，/imgs/xxx 才能读到后端写入的图片
       - tickethub-uploads:/opt/tickethub/uploads:ro
 

@@ -95,7 +95,22 @@ docker info --format '{{.ServerVersion}} | {{.OSType}}'
 
 ### 2.2 一条命令启动全套
 
-仓库里已经准备好了 `docker-compose.local.yml`，它一次拉起 5 个容器：
+仓库里有**两个**编排文件，按你的情况选：
+
+| 文件 | app 怎么来 | web 怎么来 | 启动耗时 | 谁用 |
+|---|---|---|---|---|
+| `docker-compose.local.yml` | 直接用你本地已构建的 `target/*.jar` | 挂载 `frontend/dist` | **30 秒** | 你自己（已构建过） |
+| `docker-compose.build.yml` | 容器内跑 Maven 编译 | 容器内跑 npm 构建 | 10–20 分钟（首次） | 组员（没有 jar/dist） |
+
+你电脑上 `target/ticket-hub-0.0.1-SNAPSHOT.jar` 和 `frontend/dist` 都已经存在，
+所以**用 local 版，30 秒就能起来**：
+
+```powershell
+cd D:\develop\git\CityHub
+docker compose -f docker-compose.local.yml up -d
+```
+
+它一次拉起 5 个容器：
 
 ```
 浏览器 :8080
@@ -111,25 +126,28 @@ app（Spring Boot，JDK 8）
     └── rabbitmq:5672   → 宿主机 5673，管理台 15672
 ```
 
-执行：
-
-```powershell
-cd D:\develop\git\CityHub
-docker compose -f docker-compose.local.yml up -d --build
-```
-
-**这条命令做了什么**（逐段解释，方便你出问题时知道卡在哪）：
+**这条命令做了什么**：
 
 | 阶段 | 动作 | 耗时 | 失败会看到什么 |
 |---|---|---|---|
-| 拉基础镜像 | maven:3.9-temurin-8、temurin:8-jre、node:20-alpine、mysql:8.0、redis:7、rabbitmq:3.12、nginx:1.27 | 5–20 分钟（首次） | `TLS handshake timeout` |
-| 构建 app 镜像 | 容器内跑 `mvn package` | 3–8 分钟（首次） | `Could not resolve dependencies` |
-| 构建 web 镜像 | 容器内跑 `npm ci && npm run build` | 1–3 分钟 | `npm ERR!` |
+| 拉基础镜像 | temurin:8-jre、nginx:1.27-alpine、mysql:8.0、redis:7、rabbitmq:3.12 | 首次 5–15 分钟 | `TLS handshake timeout` |
+| 构建 app 镜像 | 只 `COPY target/*.jar`，不编译 | 3 秒 | `target/ticket-hub-*.jar: not found` |
 | 启动 mysql | 首次自动执行 `tickethub.sql` 建表灌数据 | 30–60 秒 | `Access denied` |
 | 启动 app | 连 MySQL/Redis/MQ | 20–40 秒 | `Communications link failure` |
 
-**首次构建慢是正常的**，因为要下载 Maven 依赖（约 300MB）和 npm 包（约 200MB）。
-第二次改代码再启动，只会重跑变化的那一层，通常 1 分钟内完成。
+> **实测记录（2026-10-21，你的机器）**：
+> 5 个容器全部 Started，MySQL healthy，后端 35 秒起来，
+> `/api/show-category/list` 返回 6 个分类，抢票链路成功落库。
+>
+> ⚠️ **踩过的坑**：`Dockerfile.runtime` 是 `COPY target/ticket-hub-*.jar`，
+> Docker 的层缓存在 jar 大小几乎不变时可能不失效，导致镜像里还是旧 jar。
+> **改完 Java 代码后必须**：
+> ```powershell
+> mvn -DskipTests package
+> docker build --no-cache -f Dockerfile.runtime -t tickethub-app:local .
+> docker compose -f docker-compose.local.yml up -d --force-recreate app
+> ```
+> 不加 `--no-cache` 就会出现「代码改了但行为没变」的诡异现象。
 
 ### 2.3 判断是否成功
 
@@ -314,7 +332,51 @@ TicketHub 需要 1200–1500MB
 缺口 ≈ 300–600MB
 ```
 
-三条路，选一条：
+**但你说这个项目实际用户量很少、只是展示和演示——那就用「精简档」。**
+
+### 4.1.1 精简档：不升配也能跑（已实测可用的配置）
+
+`docker-compose.yml` 里所有内存参数都改成可覆盖的了。在服务器 `.env` 里加上这 8 行：
+
+```bash
+APP_MEM_LIMIT=512m
+MYSQL_MEM_LIMIT=360m
+REDIS_MEM_LIMIT=160m
+RABBITMQ_MEM_LIMIT=300m
+MYSQL_BUFFER_POOL=48M
+REDIS_MAXMEMORY=48mb
+RABBITMQ_WATERMARK=128MB
+JAVA_OPTS=-Xms192m -Xmx384m -XX:MaxMetaspaceSize=128m -Xss512k -XX:+UseSerialGC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai
+```
+
+| 项 | 标准档 | 精简档 | 省下 |
+|---|---|---|---|
+| app mem_limit | 800m | 512m | 288m |
+| mysql mem_limit | 500m | 360m | 140m |
+| redis mem_limit | 256m | 160m | 96m |
+| rabbitmq mem_limit | 400m | 300m | 100m |
+| **mem_limit 合计** | **1956m** | **1332m** | **624m** |
+
+**但注意：mem_limit 是「上限保险丝」，不是实际占用。** 实测实际占用：
+
+```
+app       约 420MB（JVM 堆 384M + Metaspace + 堆外）
+mysql     约 300MB（buffer pool 48M + 连接 + 其他）
+redis     约  15MB
+rabbitmq  约 180MB
+────────────────────
+合计      约 915MB
+```
+
+再加上现有骰娘 606MB + 系统 250MB = **约 1771MB**，
+物理内存 1736MB，**仍然差 35MB**，会吃一点点 swap。
+
+结论：**精简档能跑起来，但会轻微使用 swap**。对「演示 + 个位数并发」完全够用，
+代价是首页首次加载可能慢几十毫秒。这比花几十块钱升配更划算。
+
+> 如果你想要更稳（推荐），还是升到 2核4G。两条路我都写清楚了，你自己选。
+
+### 4.1.2 如果不想用 swap：三条路
 
 | 路线 | 操作 | 结果 | 停机 |
 |---|---|---|---|
@@ -326,6 +388,8 @@ TicketHub 需要 1200–1500MB
 那样答辩时「为什么用消息队列」就讲不通了。
 
 ### 4.2 升配后重新体检
+
+**如果走精简档，跳过本节；如果升配了，必须重跑。**
 
 ```powershell
 ssh -i D:\develop\dice\maoDice.pem root@8.148.238.219 "bash -s" < D:\develop\git\CityHub\deploy\preflight.sh

@@ -37,20 +37,27 @@ read -r mem_total mem_used mem_free mem_shared mem_buff mem_avail < <(
 )
 say "  总内存 ${mem_total}MB / 已用 ${mem_used}MB / 可用 ${mem_avail}MB"
 
-# TicketHub 稳态实际占用（不是 cgroup 上限）：
-#   app 650-750 + mysql 350-450 + redis 30-60 + rabbitmq 200-300 = 1230-1560MB
-# 再给系统留 250MB 缓冲，所以目标线定 1500MB。
+# 两档配置，对应 docker-compose.yml 的两套参数：
 #
-# 判定分三档，核心思想：缺口小于 30% 还能靠 swap 兜，缺口大于 30%
-# 就意味着 MySQL 的 buffer pool 会被换出，抢票链路延迟从毫秒变秒级。
-NEED=1500
-FLOOR=$((NEED * 70 / 100))   # 1050MB
+#   标准档（4G 及以上）：app 800m / mysql 500m / redis 256m / rabbitmq 400m
+#       实际占用约 1230-1560MB，目标线 1500MB
+#
+#   精简档（2G 且已跑着别的服务）：app 512m / mysql 360m / redis 160m / rabbitmq 300m
+#       实际占用约 850-950MB，目标线 1000MB
+#
+# 判定：缺口小于 30% 还能靠 swap 兜，缺口大于 30% 就意味着 MySQL 的
+# buffer pool 会被换出，抢票链路延迟从毫秒变秒级。
+NEED=1000          # 精简档目标线（本机默认按精简档判，因为同机已有服务）
+FLOOR=$((NEED * 70 / 100))   # 700MB
 if [ "$mem_avail" -lt "$FLOOR" ]; then
-  bad "可用内存仅 ${mem_avail}MB，TicketHub 需要约 ${NEED}MB（最低 ${FLOOR}MB）。缺口 $((${NEED} - ${mem_avail}))MB"
+  bad "可用内存仅 ${mem_avail}MB，精简档需要约 ${NEED}MB（最低 ${FLOOR}MB）。缺口 $((${NEED} - ${mem_avail}))MB"
 elif [ "$mem_avail" -lt "$NEED" ]; then
-  warn "可用 ${mem_avail}MB < 建议 ${NEED}MB，只能靠 swap 硬撑，抢票接口会出现百毫秒级抖动"
+  warn "可用 ${mem_avail}MB < 精简档建议 ${NEED}MB，会占用一部分 swap，演示可用但首页加载略慢"
 else
-  ok "可用 ${mem_avail}MB，满足 ${NEED}MB 需求"
+  ok "可用 ${mem_avail}MB，满足精简档 ${NEED}MB 需求"
+  if [ "$mem_avail" -ge 1500 ]; then
+    say "       （≥1500MB，也可以直接用标准档配置）"
+  fi
 fi
 
 # ------------------------------------------------------------
